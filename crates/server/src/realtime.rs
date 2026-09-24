@@ -1036,6 +1036,20 @@ pub struct RealtimeState {
     last_movers: Arc<AtomicI64>,
     /// Cached movers rows for the UI `(at_ms, payload)`.
     movers_cache: Arc<Mutex<(i64, Value)>>,
+    /// NIFTY trend-following direction derived from the selected straight-line
+    /// indicators: 0 neutral, +1 bullish (trade Top Gainers), -1 bearish (trade
+    /// Top Losers).
+    nifty_dir: Arc<AtomicI64>,
+    /// Straight-line indicators currently reading bullish. A bullish line is
+    /// assigned to the Top Gainer side, so only it gates the gainer legs.
+    nifty_bull_filters: Arc<Mutex<Vec<String>>>,
+    /// Straight-line indicators currently reading bearish - assigned to the Top
+    /// Loser side.
+    nifty_bear_filters: Arc<Mutex<Vec<String>>>,
+    last_trend: Arc<AtomicI64>,
+    last_nifty_scan: Arc<AtomicI64>,
+    /// Cached NIFTY-trend pick rows `(at_ms, payload)` for the UI + pick tagging.
+    nifty_picks: Arc<Mutex<(i64, Value)>>,
     /// Order timestamps (ms) in the last second, powering the HFT orders/sec cap.
     order_times: Arc<Mutex<Vec<i64>>>,
     /// Paper-only simulated entry latency: strategy id -> due ms for entries
@@ -1145,6 +1159,12 @@ impl RealtimeState {
             last_auto_side: Arc::new(AtomicI64::new(0)),
             last_movers: Arc::new(AtomicI64::new(0)),
             movers_cache: Arc::new(Mutex::new((0, Value::Null))),
+            nifty_dir: Arc::new(AtomicI64::new(0)),
+            nifty_bull_filters: Arc::new(Mutex::new(Vec::new())),
+            nifty_bear_filters: Arc::new(Mutex::new(Vec::new())),
+            last_trend: Arc::new(AtomicI64::new(0)),
+            last_nifty_scan: Arc::new(AtomicI64::new(0)),
+            nifty_picks: Arc::new(Mutex::new((0, Value::Null))),
             order_times: Arc::new(Mutex::new(Vec::new())),
             paper_pending: Arc::new(Mutex::new(HashMap::new())),
             paper_exit_pending: Arc::new(Mutex::new(HashMap::new())),
@@ -1541,6 +1561,8 @@ impl RealtimeState {
                 // engine owns its own settings/toggles, so an idle tab only fetches
                 // for scanners the operator enabled on that tab.
                 self.refresh_movers().await;
+                self.refresh_nifty_trend().await;
+                self.refresh_nifty_scan().await;
                 self.sync_auto_side();
                 // Broker account (funds/positions/holdings) and open-position LTP
                 // refresh regardless of run/arm, so the Account view is live
@@ -1828,6 +1850,15 @@ impl RealtimeState {
     /// Returns `None` when the scanner has not decided a direction, so the
     /// caller falls back to the strategy's own bullish/bearish side.
     fn auto_option_side(&self, settings: &Settings) -> Option<&'static str> {
+        if settings.nifty_trend_on {
+            let d = self.nifty_dir.load(Ordering::Relaxed);
+            if d > 0 {
+                return Some("CE");
+            }
+            if d < 0 {
+                return Some("PE");
+            }
+        }
         if settings.movers_on {
             let b = self.mover_bias.load(Ordering::Relaxed);
             if b > 0 {
@@ -2151,13 +2182,219 @@ impl RealtimeState {
         }
     }
 
+    /// Live Top Gainers / Top Losers for the NIFTY-trend engine: the shared Top
+    /// Movers scan when it is running, else a fresh scan of the same universe.
+    async fn nifty_mover_lists(&self, topn: bool, topn_n: i64, inc_idx: bool, idx_list: &[i64]) -> (Vec<Value>, Vec<Value>) {
+        let payload = self.movers_cache.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
+        let gainers: Vec<Value> = jarr(&payload, "gainers").to_vec();
+        let losers: Vec<Value> = jarr(&payload, "losers").to_vec();
+        if !gainers.is_empty() || !losers.is_empty() {
+            return (gainers, losers);
+        }
+        // Top Movers is off: rank the same universe ourselves so the NIFTY-trend
+        // side still has a Top Gainer / Top Loser set to trade.
+        let commodity_on = self.doc().map(|d| d.settings.commodity_on).unwrap_or(false);
+        let mut univ = self.scan_universe(inc_idx, commodity_on);
+        if inc_idx {
+            univ.extend(index_legs(idx_list));
+        }
+        univ.sort();
+        univ.dedup();
+        let rows = self.quote_rows(&univ).await;
+        let mut g = rows.clone();
+        g.sort_by(|a, b| jf(b, "changePct").partial_cmp(&jf(a, "changePct")).unwrap_or(std::cmp::Ordering::Equal));
+        let mut l = rows.clone();
+        l.sort_by(|a, b| jf(a, "changePct").partial_cmp(&jf(b, "changePct")).unwrap_or(std::cmp::Ordering::Equal));
+        let take = if topn { topn_n.max(1) as usize } else { usize::MAX };
+        (g.into_iter().take(take).collect(), l.into_iter().take(take).collect())
+    }
+
+    /// NIFTY trend pass #1 - direction + filter assignment. Every selected
+    /// straight-line indicator is computed on the index candles and classified
+    /// by its line direction: a rising line is bullish (assigned to the Top
+    /// Gainer side), a falling line is bearish (assigned to the Top Loser side).
+    /// Deliberately fast - only a handful of lines on one instrument.
+    async fn refresh_nifty_trend(&self) {
+        let now = now_ms();
+        if now - self.last_trend.load(Ordering::Relaxed) < 2_000 {
+            return;
+        }
+        let (enabled, tf, conf) = self
+            .doc()
+            .map(|d| (d.settings.nifty_trend_on, d.settings.nifty_tf.clone(), d.settings.nifty_trend_conf_inds.clone()))
+            .unwrap_or((false, "5min".into(), Vec::new()));
+        self.last_trend.store(now, Ordering::Relaxed);
+        if !enabled {
+            self.nifty_dir.store(0, Ordering::Relaxed);
+            if let Ok(mut b) = self.nifty_bull_filters.lock() {
+                b.clear();
+            }
+            if let Ok(mut b) = self.nifty_bear_filters.lock() {
+                b.clear();
+            }
+            return;
+        }
+        if !self.dhan.is_connected().await {
+            return;
+        }
+        let tf = if tf.eq_ignore_ascii_case("both") { "5min".to_string() } else { tf };
+        if let Ok(c) = self.live_candles(NIFTY_SEC, "IDX_I", "INDEX", &tf).await {
+            if c.len() >= 35 {
+                let (bull, bear, net) = nifty_indicator_assignment(&c, &conf);
+                let d = if net > 0 { 1 } else if net < 0 { -1 } else { 0 };
+                if let Ok(mut b) = self.nifty_bull_filters.lock() {
+                    *b = bull;
+                }
+                if let Ok(mut b) = self.nifty_bear_filters.lock() {
+                    *b = bear;
+                }
+                if d != 0 {
+                    let prev = self.nifty_dir.swap(d, Ordering::Relaxed);
+                    if prev != d {
+                        // A trend flip must re-resolve the picked strikes on the
+                        // new side immediately, not after the next scan window.
+                        self.last_nifty_scan.store(0, Ordering::Relaxed);
+                    }
+                } else {
+                    self.nifty_dir.store(0, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// NIFTY trend pass #2 - pick + assignment. Top Gainers are gated by the
+    /// bullish straight-line filters and resolve to CE legs; Top Losers are
+    /// gated by the bearish filters and resolve to PE legs. When only one side
+    /// is selected only that side trades; when both are selected both filter
+    /// lists run, each strictly on its own side.
+    async fn refresh_nifty_scan(&self) {
+        let now = now_ms();
+        if now - self.last_nifty_scan.load(Ordering::Relaxed) < 15_000 {
+            return;
+        }
+        let (enabled, topn, topn_n, inc_idx, idx_list, settings) = self
+            .doc()
+            .map(|d| {
+                (
+                    d.settings.nifty_trend_on,
+                    d.settings.nifty_trend_topn,
+                    d.settings.nifty_trend_topn_count.max(1),
+                    d.settings.nifty_trend_indices,
+                    d.settings.nifty_trend_index_list.clone(),
+                    d.settings.clone(),
+                )
+            })
+            .unwrap_or((false, true, 5, false, Vec::new(), Settings::default()));
+        if !enabled {
+            self.update_picked("NIFTY trend", Vec::new());
+            if let Ok(mut g) = self.nifty_picks.lock() {
+                *g = (now, Value::Null);
+            }
+            return;
+        }
+        if !self.dhan.is_connected().await {
+            return;
+        }
+        self.last_nifty_scan.store(now, Ordering::Relaxed);
+        let bull_on = self.nifty_bull_filters.lock().map(|g| !g.is_empty()).unwrap_or(false);
+        let bear_on = self.nifty_bear_filters.lock().map(|g| !g.is_empty()).unwrap_or(false);
+        // No line has read a direction yet: nothing to assign.
+        if !bull_on && !bear_on {
+            self.update_picked("NIFTY trend", Vec::new());
+            return;
+        }
+        let (gainers, losers) = self.nifty_mover_lists(topn, topn_n, inc_idx, &idx_list).await;
+        let mut legs: Vec<Value> = Vec::new();
+        for (side, list, active) in [("CE", &gainers, bull_on), ("PE", &losers, bear_on)] {
+            if !active {
+                continue;
+            }
+            for r in list.iter() {
+                let sid = ji(r, "securityId");
+                let spot = jf(r, "last");
+                let Some((name, seg, inst)) = crate::market::symbol_meta(sid) else { continue };
+                if let Some(leg) = self.pick_leg(&settings, sid, &name, &seg, &inst, spot, side) {
+                    legs.push(json!({
+                        "securityId": leg.security_id,
+                        "underlying": name,
+                        "side": side,
+                        "tradingSymbol": leg.trading_symbol,
+                        "segment": leg.exchange_segment,
+                        "instrument": leg.instrument,
+                        "spot": round2(spot),
+                        "changePct": jf(r, "changePct"),
+                        "source": "NIFTY trend",
+                        "runMode": run_mode_for(&seg, &inst, &settings),
+                        "underlyingSecurityId": sid,
+                        "underlyingSegment": seg,
+                        "underlyingInstrument": inst,
+                    }));
+                }
+            }
+        }
+        self.update_picked("NIFTY trend", legs.clone());
+        let payload = json!({
+            "ok": true, "at": now, "dir": self.nifty_dir.load(Ordering::Relaxed),
+            "bullFilters": self.nifty_bull_filters.lock().map(|g| g.clone()).unwrap_or_default(),
+            "bearFilters": self.nifty_bear_filters.lock().map(|g| g.clone()).unwrap_or_default(),
+            "gainers": gainers, "losers": losers, "picks": legs,
+        });
+        if let Ok(mut g) = self.nifty_picks.lock() {
+            *g = (now, payload);
+        }
+        // A picked stock that stops qualifying is dropped immediately: close any
+        // open position originally tagged as a NIFTY-trend pick.
+        let keep = self.nifty_pick_underlyings();
+        let drops: Vec<String> = self
+            .doc()
+            .map(|d| {
+                d.positions
+                    .iter()
+                    .filter(|p| jb(p, "niftyPick") && !keep.contains(&js(p, "underlying").to_uppercase()))
+                    .map(|p| js(p, "id"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in drops {
+            let ltp = self.position_ltp(&id);
+            let _ = self.close_position(&id, "nifty_pick_drop", ltp).await;
+        }
+    }
+
+    async fn nifty_readout(&self) -> Value {
+        let (at, payload) = self.nifty_picks.lock().map(|g| (g.0, g.1.clone())).unwrap_or((0, Value::Null));
+        if payload.is_object() {
+            payload
+        } else {
+            json!({ "ok": true, "at": at, "dir": self.nifty_dir.load(Ordering::Relaxed), "picks": [] })
+        }
+    }
+
+    /// Underlyings currently picked by the NIFTY-trend scanner, used to tag the
+    /// positions it opened (and to close a pick the moment it drops out).
+    fn nifty_pick_underlyings(&self) -> Vec<String> {
+        let payload = self.nifty_picks.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
+        jarr(&payload, "picks")
+            .iter()
+            .map(|p| js(p, "underlying").to_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
     /// Resolve the direction-specific AST template (if assigned) and return its
     /// saved settings, which override the manual gate/filter set for this entry.
     fn template_for_direction(&self, settings: &Settings, strat: &Strategy) -> Option<Settings> {
         let mut name = String::new();
         // Mirror `auto_option_side` precedence so the resolved template carries
         // the same side as the strategy set and the executed leg.
-        if settings.movers_on {
+        if settings.nifty_trend_on {
+            let d = self.nifty_dir.load(Ordering::Relaxed);
+            if d > 0 {
+                name = settings.nifty_bull_template.clone();
+            } else if d < 0 {
+                name = settings.nifty_bear_template.clone();
+            }
+        } else if settings.movers_on {
             let b = self.mover_bias.load(Ordering::Relaxed);
             if b > 0 {
                 name = settings.mover_bull_template.clone();
@@ -2264,12 +2501,19 @@ impl RealtimeState {
     fn scanner_targets(&self, settings: &Settings) -> Vec<Strategy> {
         let bull_side = settings.filters.iter().any(|(k, v)| *v && filter_is_bull(k));
         let bear_side = settings.filters.iter().any(|(k, v)| *v && filter_is_bear(k));
-        if !bull_side && !bear_side {
+        // NIFTY-trend assignment: the bullish straight-line filters gate the Top
+        // Gainer legs, the bearish ones the Top Loser legs. Each side is allowed
+        // independently, so when both are assigned both run together.
+        let nifty_allow_bull = settings.nifty_trend_on
+            && self.nifty_bull_filters.lock().map(|g| !g.is_empty()).unwrap_or(false);
+        let nifty_allow_bear = settings.nifty_trend_on
+            && self.nifty_bear_filters.lock().map(|g| !g.is_empty()).unwrap_or(false);
+        if !bull_side && !bear_side && !nifty_allow_bull && !nifty_allow_bear {
             return Vec::new();
         }
         let active = self.active_side(settings);
         let (allow_bull, allow_bear) = side_allowed(bull_side, bear_side, active);
-        if !allow_bull && !allow_bear {
+        if !allow_bull && !allow_bear && !nifty_allow_bull && !nifty_allow_bear {
             return Vec::new();
         }
 
@@ -2364,6 +2608,26 @@ impl RealtimeState {
             }
             for id in &settings.movers_indices {
                 add(&mut out, &mut seen, *id, None, allow_bull, allow_bear);
+            }
+        }
+
+        // NIFTY trend: Top Gainers (CE) gated by the bullish straight-line
+        // filters, Top Losers (PE) by the bearish ones. Both sides run together
+        // when both lists are assigned.
+        if settings.nifty_trend_on {
+            let payload = self.nifty_picks.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
+            for p in jarr(&payload, "picks") {
+                let sid = ji(&p, "underlyingSecurityId");
+                if sid <= 0 {
+                    continue;
+                }
+                if js(&p, "side").eq_ignore_ascii_case("CE") {
+                    if nifty_allow_bull {
+                        add(&mut out, &mut seen, sid, Some(true), true, true);
+                    }
+                } else if nifty_allow_bear {
+                    add(&mut out, &mut seen, sid, Some(false), true, true);
+                }
             }
         }
 
@@ -4173,6 +4437,10 @@ impl RealtimeState {
             .subscribe_options(&[(strat.security_id, exch.clone())])
             .await;
 
+        let is_nifty_pick = self
+            .nifty_pick_underlyings()
+            .iter()
+            .any(|u| u.eq_ignore_ascii_case(&underlying));
         let pos_id = gen_id("rtpos");
         let position = json!({
             "id": pos_id,
@@ -4204,7 +4472,7 @@ impl RealtimeState {
             "superOrders": super_orders,
             "broker": broker,
             "reconciled": false,
-            "niftyPick": false,
+            "niftyPick": is_nifty_pick,
             "status": "running",
             "orderType": if fno_limit_px > 0.0 { "FNO_LIMIT" } else { "MARKET" },
             "limitPrice": fno_limit_px,
@@ -4663,6 +4931,36 @@ fn mtf_pair(settings: &Settings) -> Option<(String, String)> {
     } else {
         Some((entry.to_string(), trend.to_string()))
     }
+}
+
+/// NIFTY index security id: the instrument the trend-following engine reads the
+/// selected straight-line indicators on.
+const NIFTY_SEC: i64 = 13;
+
+/// NIFTY trend-following filter assignment (the straight-line -> side mapper).
+///
+/// Each selected straight-line indicator is computed on the index candles and
+/// classified by its *line direction* - the latest plotted value against the one
+/// before it: rising -> bullish, falling -> bearish, flat -> neutral. Bullish
+/// ids are assigned to the Top Gainer side, bearish ids to the Top Loser side,
+/// so a bullish line trades gainers and a bearish line trades losers. Returns
+/// `(bullish_ids, bearish_ids, net)` where `net = bullish - bearish`.
+fn nifty_indicator_assignment(candles: &[Candle], conf: &[String]) -> (Vec<String>, Vec<String>, i64) {
+    let st = algo_core::model::Settings::default();
+    let mut bull: Vec<String> = Vec::new();
+    let mut bear: Vec<String> = Vec::new();
+    for id in conf {
+        let out = algo_core::compute(id, candles, &st);
+        let Some(s) = out.first() else { continue };
+        let (Some(v0), Some(v1)) = (series_value(s, 0), series_value(s, 1)) else { continue };
+        if v0 > v1 {
+            bull.push(id.clone());
+        } else if v0 < v1 {
+            bear.push(id.clone());
+        }
+    }
+    let net = bull.len() as i64 - bear.len() as i64;
+    (bull, bear, net)
 }
 
 fn series_value(s: &algo_core::model::SeriesOut, from_end: usize) -> Option<f64> {    let n = s.data.len();
@@ -6929,13 +7227,16 @@ fn snap_of(rt: &RealtimeState) -> Value {
         .map(|g| g.1.clone())
         .unwrap_or_default();
     let final_list = final_scan(&d, &d.closed, charges_on);
-    // NIFTY trend readout for the engine header. The trend-following engine
-    // logic was removed; these keys stay (dir always 0, picks empty) so the
-    // existing UI keeps rendering until the replacement function lands.
+    // NIFTY trend readout for the engine header: the direction the assigned
+    // straight-line indicators produced and the bullish/bearish filter split.
+    let nifty_bull = rt.nifty_bull_filters.lock().map(|g| g.clone()).unwrap_or_default();
+    let nifty_bear = rt.nifty_bear_filters.lock().map(|g| g.clone()).unwrap_or_default();
     let nifty_trend = json!({
         "on": d.settings.nifty_trend_on,
         "tf": d.settings.nifty_tf,
-        "dir": 0,
+        "dir": rt.nifty_dir.load(Ordering::Relaxed),
+        "bullFilters": nifty_bull,
+        "bearFilters": nifty_bear,
     });
     // Surface the timeframe the engine will actually run each strategy on (the
     // 1min/5min checkboxes + Multi-TF confirm override), so the Running
@@ -7060,7 +7361,7 @@ fn snap_of(rt: &RealtimeState) -> Value {
         "brokerPositions": broker_positions,
         "holdings": broker_holdings,
         "movers": movers,
-        "niftyPicks": [],
+        "niftyPicks": rt.nifty_picks.lock().map(|g| g.1.clone()).unwrap_or(Value::Null),
         "niftyTrend": nifty_trend,
         "autoSide": auto_side,
         "activeRunInSide": active_run_in_side,
@@ -7885,12 +8186,28 @@ pub async fn template_post(State(rt): State<RealtimeState>, Json(v): Json<Value>
 }
 
 pub async fn trend_get(State(rt): State<RealtimeState>) -> impl IntoResponse {
-    // NIFTY trend-following engine removed. Keep the route returning an empty
-    // readout so the existing UI (which calls /trend on every refresh) stays
-    // functional until the replacement function lands.
+    // NIFTY trend-following readout. Re-run the (throttled) trend + scan passes so
+    // the header is fresh even between engine ticks, then return the pick detail.
     let on = rt.doc().map(|d| d.settings.nifty_trend_on).unwrap_or(false);
-    let detail = json!({ "ok": true, "at": 0, "dir": 0, "picks": [] });
-    Json(json!({ "ok": true, "on": on, "dir": 0, "picks": [], "detail": detail }))
+    rt.refresh_nifty_trend().await;
+    rt.refresh_nifty_scan().await;
+    let detail = rt.nifty_readout().await;
+    let dir = rt.nifty_dir.load(Ordering::Relaxed);
+    // Surface each pick by its underlying (the id the UI removes / the scanner
+    // excludes), not the resolved option leg.
+    let picks: Vec<Value> = jarr(&detail, "picks")
+        .iter()
+        .map(|p| {
+            json!({
+                "securityId": ji(p, "underlyingSecurityId"),
+                "underlying": js(p, "underlying"),
+                "side": js(p, "side"),
+                "tradingSymbol": js(p, "tradingSymbol"),
+                "changePct": jf(p, "changePct"),
+            })
+        })
+        .collect();
+    Json(json!({ "ok": true, "on": on, "dir": dir, "picks": picks, "detail": detail }))
 }
 
 // ---------------------------------------------------------------------------
@@ -8360,6 +8677,25 @@ mod gate_tests {
             }
         }
         assert!(arrows > 0, "Arrow Consensus must fire at least once");
+    }
+
+    #[test]
+    fn nifty_indicator_assignment_splits_call_and_put() {
+        let conf: Vec<String> = ["autotrend", "zzline", "trendmaster", "projline"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // A steadily rising index resolves the straight-line trend indicators
+        // bullish -> net positive, every id lands in the CE bucket.
+        let up = ramp(400, 100.0, 0.6);
+        let (bull, bear, net) = nifty_indicator_assignment(&up, &conf);
+        assert!(net > 0, "rising index must net bullish, got {net}");
+        assert!(!bull.is_empty() && bear.is_empty());
+        // The mirror-image falling index flips the assignment to the PE bucket.
+        let down = ramp(400, 340.0, -0.6);
+        let (bull2, bear2, net2) = nifty_indicator_assignment(&down, &conf);
+        assert!(net2 < 0, "falling index must net bearish, got {net2}");
+        assert!(!bear2.is_empty() && bull2.is_empty());
     }
 
     #[test]

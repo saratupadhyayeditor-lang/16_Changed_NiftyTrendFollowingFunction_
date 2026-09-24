@@ -2206,7 +2206,6 @@ async function loadScanners() {
           : "neutral / computing... (needs Dhan connection + 35 candles)";
       const picks = (t && t.picks) || [];
       const pfmt = picks
-        .slice(0, 20)
         .map(
           (p) =>
             `<span style="display:inline-flex;align-items:center;gap:3px;background:#16163a;border:1px solid #2d2d50;border-radius:8px;padding:1px 4px;margin:1px">` +
@@ -2429,7 +2428,11 @@ function populateAstSelects() {
   if (!indices.length && !inds.length) return;
   fill("rtMoversIndicesSelect", indices, (r) => `${r.s.name} (${r.v})`);
   fill("rtNiftyTrendIndicesSelect", indices, (r) => `${r.s.name} (${r.v})`);
-  fill("rtNiftyTrendConfIndSelect", inds, (r) => `${r.i.name || r.i.id}${r.i.cat ? " · " + r.i.cat : ""}`);
+  // NIFTY Trend Following reads only straight-line indicators (their line
+  // direction decides the side), so its confirm list is restricted to them.
+  const straightIds = ["slconsensus", "ovlconsensus", "autotrend", "projline", "zzline", "trendmaster", "panemaster", "srema", "supline", "resline", "pitchfork", "fibfan", "gannfan", "supplydemand", "wavefib", "pastruct", "vl"];
+  const straightInds = inds.filter((r) => straightIds.includes(String(r.v)));
+  fill("rtNiftyTrendConfIndSelect", straightInds, (r) => `${r.i.name || r.i.id}${r.i.cat ? " · " + r.i.cat : ""}`);
   astSelectsPopulated = true;
   renderAllChips();
 }

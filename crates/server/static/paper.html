@@ -76,7 +76,7 @@
   })();
 </script>
 <script type="module">
-  import { bootRealtime } from "./realtime.js?v=57";
+  import { bootRealtime } from "./realtime.js?v=65";
   bootRealtime();
   const title = document.querySelector("#tab-realtime .rt-strip .rt-title");
   if (title) title.textContent = "Paper Trade (Simulated)";
@@ -96,6 +96,7 @@
     funds.insertAdjacentHTML(
       "afterend",
       box("Capital \u20b9", "paperCapital", 'min="0" step="10000"') +
+        box("Margin \u20b9", "marginAmount", 'min="0" step="10000" title="Manual margin amount (rupees): the paper engine locks at most this much across running trades, capped by the available capital. 0 = use the Margin-to-use % instead."') +
         box("Slippage bps", "paperSlippageBps", 'min="0" step="0.5"') +
         box("Reject %", "paperRejectPct", 'min="0" max="100" step="1"') +
         '<label class="rt-pill" style="display:flex;align-items:center;gap:4px;color:#ffd700" ' +
@@ -105,6 +106,11 @@
           'title="Paper execution latency: entry condition meet hone par trade turant nahi, yahan set kiye gaye milliseconds ke baad execute hoga (real order latency ki tarah). Checkbox off = bilkul inactive, trade turant.">' +
           '<input type="checkbox" data-set="paperExecDelayOn" style="accent-color:#00d4aa"> Exec delay' +
           '<input type="number" data-set="paperExecDelayMs" min="0" step="50"' +
+          ' style="width:70px;background:#0a0a18;color:#e0e0ff;border:1px solid #3a3a60;border-radius:3px;padding:1px 4px;font-size:10px"> ms</label>' +
+        '<label class="rt-pill" style="display:flex;align-items:center;gap:4px;color:#ff7b72" ' +
+          'title="Paper exit latency: SL / Trail-SL / Target par trade turant nahi, yahan set kiye gaye milliseconds ke baad cut hoga. Book wahi level par hoga jo bina delay hota (SL par SL, Trail par Trail, Target par Target) - delay sirf cut ko late karta hai, price ko badalta nahi. Checkbox off = exit turant.">' +
+          '<input type="checkbox" data-set="paperExitDelayOn" style="accent-color:#ff7b72"> Exit delay' +
+          '<input type="number" data-set="paperExitDelayMs" min="0" step="50"' +
           ' style="width:70px;background:#0a0a18;color:#e0e0ff;border:1px solid #3a3a60;border-radius:3px;padding:1px 4px;font-size:10px"> ms</label>' +
         '<label class="rt-pill" style="display:flex;align-items:center;gap:4px;color:#ffb74d" ' +
           'title="F&O Limit entry (paper only, buying only): buy entry ko Dhan ki tarah market se upar limit price par lagata hai, jisse order 100% fill hota hai (market order jaisa). Limit kabhi entry se neeche nahi lagti; sell par lagu nahi hota.">' +
@@ -125,12 +131,17 @@
       inp.addEventListener("change", function () { inp.value = post(key, inp.value, clamp); });
     };
     bind("paperCapital", function (v) { return v; });
+    bind("marginAmount", function (v) { return v; });
     bind("paperSlippageBps", function (v) { return v; });
     bind("paperRejectPct", function (v) { return Math.min(100, v); });
     // Paper execution-latency: the ms field is a non-negative whole number; the
     // checkbox is the master on/off. Off means the engine never queues a
     // delayed entry (fully inactive), so the paper book fills instantly.
     bind("paperExecDelayMs", function (v) { return Math.round(v); });
+    // Paper exit-latency: same idea as the entry delay, but for the cut
+    // (SL / Trail-SL / Target). Off means an exit books inline at the trigger
+    // level; on means it lands `paperExitDelayMs` later at the live mark.
+    bind("paperExitDelayMs", function (v) { return Math.round(v); });
     // F&O Limit entry toggle: paper-only, buying-only. When on, the entry is
     // placed as a marketable limit above the market (Dhan-style), so it always
     // fills like a market order and never sits behind the entry.
@@ -151,6 +162,16 @@
           method: "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({ paperExecDelayOn: !!delayCb.checked }),
+        });
+      });
+    }
+    const exitDelayCb = funds.parentNode.querySelector('input[data-set="paperExitDelayOn"]');
+    if (exitDelayCb) {
+      exitDelayCb.addEventListener("change", function () {
+        fetch("/api/rt/settings", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ paperExitDelayOn: !!exitDelayCb.checked }),
         });
       });
     }

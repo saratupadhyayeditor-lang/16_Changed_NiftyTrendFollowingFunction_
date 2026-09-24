@@ -56,6 +56,20 @@ pub fn tf_bucket_secs(tf: &str) -> i64 {
     }
 }
 
+/// IST seconds-of-day at which the regular session opens. The pre-open call
+/// auction (IST 09:00-09:15) is not a real trading session, so a tick in that
+/// window must not seed or advance a bar - otherwise the engine starts on a
+/// pre-market candle that never exists on the real chart. Applied to every
+/// timeframe; the MCX evening session (till 23:30) is unaffected because only
+/// the morning pre-09:15 window is gated.
+pub const IST_SESSION_OPEN_SECS: i64 = 9 * 3600 + 15 * 60;
+
+/// Whether a tick timestamped `now_ist` (epoch seconds whose clock value is IST)
+/// belongs to the regular session and may form/advance a candle.
+pub fn ist_session_started(now_ist: i64) -> bool {
+    now_ist.rem_euclid(86_400) >= IST_SESSION_OPEN_SECS
+}
+
 /// Bound on the number of tick-maintained candle series kept in memory.
 const LIVE_BARS_CAP: usize = 2048;
 
@@ -353,6 +367,12 @@ impl MarketState {
         if sec_id <= 0 || price <= 0.0 {
             return;
         }
+        // No candle forms before the regular session opens (IST 09:15). The
+        // pre-open call auction streams indicative ticks that would otherwise
+        // create a pre-market bar the real chart never shows.
+        if !ist_session_started(now_ist) {
+            return;
+        }
         let keys = match self.bar_index.lock() {
             Ok(idx) => match idx.get(&sec_id) {
                 Some(k) if !k.is_empty() => k.clone(),
@@ -628,5 +648,48 @@ async fn ws_loop(mut socket: WebSocket, st: DhanState) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ist(h: i64, m: i64) -> i64 {
+        h * 3600 + m * 60
+    }
+
+    #[test]
+    fn no_candles_before_regular_session_open() {
+        // Pre-open call auction (09:00-09:14:59) must not form a candle.
+        assert!(!ist_session_started(ist(9, 0)));
+        assert!(!ist_session_started(ist(9, 14) + 59));
+        assert!(!ist_session_started(ist(8, 59) + 59));
+        assert!(!ist_session_started(0));
+        // Regular session onward forms candles, through the MCX evening close.
+        assert!(ist_session_started(ist(9, 15)));
+        assert!(ist_session_started(ist(15, 30)));
+        assert!(ist_session_started(ist(23, 30)));
+    }
+
+    #[test]
+    fn patch_tick_ignores_pre_market_window() {
+        let m = MarketState::new();
+        // Seed a previous-day last bar so the series is tick-patchable.
+        let seed = vec![
+            Candle { time: 86_400 + ist(9, 15), open: 100.0, high: 101.0, low: 99.0, close: 100.5, volume: 0.0 },
+            Candle { time: 86_400 + ist(9, 16), open: 100.5, high: 102.0, low: 100.0, close: 101.0, volume: 0.0 },
+            Candle { time: 86_400 + ist(9, 17), open: 101.0, high: 101.5, low: 100.5, close: 101.2, volume: 0.0 },
+        ];
+        m.seed_bars(7, "1min", seed.clone());
+        // A pre-open tick must leave the series untouched.
+        m.patch_tick(7, 555.0, 86_400 + ist(9, 5));
+        let before = m.live_bars_for(7, "1min", Duration::from_secs(60)).unwrap();
+        assert_eq!(before.len(), seed.len());
+        assert_eq!(before.last().unwrap().close, 101.2);
+        // The first post-open tick advances the series.
+        m.patch_tick(7, 106.0, 86_400 + ist(9, 18));
+        let after = m.live_bars_for(7, "1min", Duration::from_secs(60)).unwrap();
+        assert_eq!(after.last().unwrap().close, 106.0);
     }
 }

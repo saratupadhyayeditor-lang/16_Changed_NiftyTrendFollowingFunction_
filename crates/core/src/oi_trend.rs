@@ -683,7 +683,13 @@ impl Default for RegimeOpts {
     }
 }
 
-/// EMA-like trend-state line with hysteresis. Mirrors `regimeLine()`.
+/// Trend-state line with hysteresis, drawn as STRAIGHT segments. The regime is
+/// still decided the same way as `regimeLine()` (fast/slow EMA + ATR band), but
+/// the plotted line does not follow the EMA tick-by-tick: every regime run is a
+/// single straight line from its first to its last value. This means a run that
+/// is classified flat but whose fast EMA still drifts (common while the EMAs
+/// are converging during a move) is drawn as a sloped straight line following
+/// that drift, and only a genuinely unchanged run stays horizontal.
 pub fn regime_line(candles: &[Candle], opts: &RegimeOpts) -> RegimeResult {
     let n = candles.len();
     let closes: Vec<f64> = candles.iter().map(|c| c.close).collect();
@@ -722,28 +728,40 @@ pub fn regime_line(candles: &[Candle], opts: &RegimeOpts) -> RegimeResult {
         regs[i] = regime;
     }
 
+    // Straight trend segments: each run of the same regime is drawn as ONE
+    // straight line from its first to its last fast-EMA value instead of
+    // following the EMA tick-by-tick, so the overlay reads as clean straight
+    // trend lines (not an EMA-like curve). Every run is interpolated, including
+    // flat runs: if the fast EMA drifted while the regime stayed flat, the
+    // segment slopes with that drift (so a bullish/bearish move never shows as
+    // a horizontal plate); a run with no change stays horizontal. Consecutive
+    // runs share the boundary EMA value, so the segments join without steps.
     let mut data = Vec::with_capacity(n);
-    let mut state = Regime::Flat;
-    let mut pivot: Option<f64> = None;
-    for i in 0..n {
+    let mut i = 0usize;
+    while i < n {
         let r = regs[i];
-        if r != Regime::Flat && state == Regime::Flat {
-            state = r;
-            pivot = None;
-        } else if r == Regime::Flat && state != Regime::Flat {
-            state = Regime::Flat;
-            pivot = Some(e_f[i]);
+        let mut j = i;
+        while j + 1 < n && regs[j + 1] == r {
+            j += 1;
         }
-        let value = if state == Regime::Flat {
-            let p = *pivot.get_or_insert(e_f[i]);
-            p
-        } else {
-            e_f[i]
-        };
-        data.push(TrendPoint {
-            time: candles[i].time,
-            value: (value * 100.0).round() / 100.0,
-        });
+        let t0 = candles[i].time as f64;
+        let t1 = candles[j].time as f64;
+        let v0 = e_f[i];
+        let v1 = e_f[j];
+        let dt = t1 - t0;
+        for k in i..=j {
+            let value = if dt.abs() > 0.0 {
+                let w = (candles[k].time as f64 - t0) / dt;
+                v0 + (v1 - v0) * w
+            } else {
+                e_f[k]
+            };
+            data.push(TrendPoint {
+                time: candles[k].time,
+                value: (value * 100.0).round() / 100.0,
+            });
+        }
+        i = j + 1;
     }
 
     let li = n.saturating_sub(1);
@@ -1405,6 +1423,44 @@ mod tests {
         // trending line follows the fast EMA (rounded to 2dp)
         let li = 59;
         assert!((r.data[li].value - (r.last.ema_f * 100.0).round() / 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn regime_line_draws_straight_segments() {
+        // A zig-zag so both trending and flat runs appear.
+        let mut cs = Vec::new();
+        let mut price = 100.0;
+        for i in 0..140 {
+            let drift = if (i / 20) % 2 == 0 { 0.6 } else { -0.35 };
+            price += drift;
+            cs.push(c(i, price, price + 1.0, price - 1.0, price, 1000.0 + i as f64 * 10.0));
+        }
+        let r = regime_line(&cs, &RegimeOpts::default());
+        let n = r.data.len();
+        let mut i = 0usize;
+        while i < n {
+            let reg = r.regs[i];
+            let mut j = i;
+            while j + 1 < n && r.regs[j + 1] == reg {
+                j += 1;
+            }
+            let t = |k: usize| r.data[k].time as f64;
+            let v = |k: usize| r.data[k].value;
+            if j > i + 1 {
+                // Every run is ONE straight line (collinear), including flat
+                // runs whose fast EMA still drifted.
+                let s0 = (v(i + 1) - v(i)) / (t(i + 1) - t(i));
+                for k in (i + 1)..j {
+                    let s = (v(k + 1) - v(k)) / (t(k + 1) - t(k));
+                    assert!((s - s0).abs() < 0.02, "run not straight at {k}: {s} vs {s0}");
+                }
+            }
+            // A flat run must not be forced horizontal when its value moved.
+            if reg == Regime::Flat && j > i && (v(j) - v(i)).abs() > 1.0 {
+                assert!((v(i + 1) - v(i)).abs() > 0.0, "drifting flat run is horizontal");
+            }
+            i = j + 1;
+        }
     }
 
     #[test]

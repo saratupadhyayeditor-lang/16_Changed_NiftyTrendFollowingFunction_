@@ -243,6 +243,66 @@ pub fn auto_trend_line(c: &[Candle], piv: &[Pivot], look: f64, tol: f64) -> Opti
     best
 }
 
+/// Best straight line through one side's swing pivots (support = lows,
+/// resistance = highs). The line is scored on the pivots themselves: it is
+/// rewarded for passing through (touching) as many same-side pivots as possible
+/// and heavily penalised for cutting through one (a support low below the line /
+/// a resistance high above it). A mild proximity term keeps it by the current
+/// price, and a wrong-side line (support above price / resistance below) is
+/// rejected, so the fit never drifts away from the chart.
+pub fn side_trend_line(c: &[Candle], side: &[Pivot], look: f64, tol: f64, support: bool) -> Option<AutoLine> {
+    let l0 = rnd(look);
+    let l0 = if l0 == 0.0 { 12.0 } else { l0 };
+    let look = l0.max(2.0) as usize;
+    if side.len() < 2 {
+        return None;
+    }
+    let z: Vec<Pivot> = if look <= side.len() { side[side.len() - look..].to_vec() } else { side.to_vec() };
+    let last_idx = c.len() - 1;
+    let last_close = c[last_idx].close;
+    let mut best: Option<AutoLine> = None;
+    for i in 0..z.len() {
+        for j in (i + 1)..z.len() {
+            let p1 = &z[i];
+            let p2 = &z[j];
+            let di = p2.idx as i64 - p1.idx as i64;
+            if di <= 0 {
+                continue;
+            }
+            let a = (p2.price - p1.price) / di as f64;
+            let b = p2.price - a * p2.idx as f64;
+            // Score on the swing pivots: touches = pivots the line passes
+            // through, breaks = pivots it cuts through the wrong way.
+            let mut touches = 0.0f64;
+            let mut breaks = 0.0f64;
+            for q in &z {
+                if q.idx < p1.idx {
+                    continue;
+                }
+                let v = a * q.idx as f64 + b;
+                if (q.price - v).abs() <= tol {
+                    touches += 1.0;
+                } else if support && q.price < v - tol {
+                    breaks += 1.0;
+                } else if !support && q.price > v + tol {
+                    breaks += 1.0;
+                }
+            }
+            let span = di as f64;
+            let last_v = a * last_idx as f64 + b;
+            let prox = if tol > 0.0 { (last_v - last_close).abs() / tol } else { (last_v - last_close).abs() };
+            let wrong_side = if support { last_v > last_close + tol } else { last_v < last_close - tol };
+            let score = touches * 3.0 - breaks * 6.0 + span / (c.len().max(1) as f64)
+                - prox * 0.5
+                - if wrong_side { 100.0 } else { 0.0 };
+            if best.is_none() || score > best.unwrap().score {
+                best = Some(AutoLine { a, b, p1_idx: p1.idx, p2_idx: p2.idx, is_support: support, score });
+            }
+        }
+    }
+    best
+}
+
 pub fn last_alternating_pivots(piv: &[Pivot], count: usize) -> Option<Vec<Pivot>> {
     if piv.len() < count || count == 0 {
         return None;

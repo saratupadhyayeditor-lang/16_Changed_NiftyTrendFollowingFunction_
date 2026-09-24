@@ -70,6 +70,46 @@ fn gen_id(prefix: &str) -> String {
     format!("{prefix}_{}", now_ms())
 }
 
+/// Dhan's order `correlationId` must be a short, unique token: the engine's
+/// internal strategy ids (`scan:12345:CE`, `rtstrat_1789...`) carry `:` / `_`
+/// and repeat on every entry, which Dhan rejects with
+/// `DH-905 (Input_Exception): Invalid correlationId` - so every order is sent a
+/// fresh sanitized value instead. Kept alphanumeric and <= 23 chars.
+fn corr_id(tag: &str) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let mut safe: String = tag.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect();
+    if safe.is_empty() {
+        safe.push_str("ord");
+    }
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{safe}{}{:04}", now_ms() % 100_000_000_000, n % 10_000)
+}
+
+#[cfg(test)]
+mod corr_tests {
+    use super::corr_id;
+
+    /// Dhan rejects ids that are non-alphanumeric / longer than 25 chars with
+    /// `DH-905`, so every generated id must stay within those bounds even for
+    /// the engine's `scan:12345:CE` / `rtstrat_...` strategy ids.
+    #[test]
+    fn correlation_ids_are_alphanumeric_short_and_unique() {
+        let ids: Vec<String> = (0..200)
+            .map(|i| corr_id(if i % 2 == 0 { "scan:12345:CE" } else { "rtstrat_1789836974927" }))
+            .collect();
+        for id in &ids {
+            assert!(id.chars().all(|c| c.is_ascii_alphanumeric()), "non-alnum: {id}");
+            assert!(id.len() <= 25, "too long: {id}");
+            assert!(!id.is_empty());
+        }
+        let mut uniq = ids.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), ids.len(), "correlation ids must be unique");
+    }
+}
+
 /// Current IST wall-clock as minutes past midnight.
 fn ist_minutes() -> i64 {
     let secs = crate::market::now_secs() + 19800;
@@ -113,6 +153,10 @@ pub struct Settings {
     /// The engine locks at most this share across running trades and blocks the
     /// next entry whose required margin would exceed the remaining budget.
     pub margin_pct: f64,
+    /// Manual margin amount (rupees). When `> 0` it takes priority over
+    /// `margin_pct`: the engine locks at most this many rupees (capped by the
+    /// live available balance) across running trades. `0` = use the percentage.
+    pub margin_amount: f64,
     pub sl_auto: bool,
     pub tf_1min: bool,
     pub tf_5min: bool,
@@ -188,15 +232,16 @@ pub struct Settings {
     pub commodity_on: bool,
     pub commodity_list: Vec<i64>,
     /// Underlying security ids the operator removed from the scanner picks
-    /// (Top Movers gainers/losers, NIFTY trend). An excluded id never enters the
+    /// (Top Movers gainers/losers). An excluded id never enters the
     /// scanner universe, so it is not ranked, not resolved to an option leg and
     /// not traded until restored. Persisted with the rest of the settings.
     pub scanner_exclude: Vec<i64>,
     // --- Run mode (old AST run-mode section) ---
     /// Run mode: `false` = Normal mode (run the ticked/enabled/AI-picked
     /// strategies), `true` = Indicator-filters mode (trade the scanner universe
-    /// - Top Movers / NIFTY trend / Commodities - with every ticked
-    /// Bullish/Bearish filter passing together, strict AND).
+    /// - Top Movers / Commodities - with the ticked
+    /// Bullish/Bearish filters agreeing by majority; tick `all_in_one` to demand
+    /// every filter, or enable AI Brain for a score/veto gate).
     pub filter_mode: bool,
     // --- Entry gate modes ---
     pub all_in_one: bool,
@@ -213,6 +258,42 @@ pub struct Settings {
     /// `IncUp`, `CrossDown`, `BullEmaTrend9`, `BearMeetCloseVwap`, ... Each maps
     /// to a boolean so the engine can rebuild the entry gate set.
     pub filters: BTreeMap<String, bool>,
+    // --- Straight Line Consensus indicator-filter settings. The filter rows
+    // read these (default 0 = flip the instant the majority vote flips; no
+    // confirm wait and no structural gate). Colours / line width are kept for
+    // parity with the chart indicator's settings panel.
+    pub sc_min_agree: f64,
+    pub sc_confirm: f64,
+    pub sc_strength: f64,
+    pub sc_up_color: String,
+    pub sc_down_color: String,
+    pub sc_flat_color: String,
+    pub sc_line_width: f64,
+    // --- Support / Resistance Trendline indicator-filter settings. The filter
+    // rows read these (Pivot strength / ATR period / Min tol % / Tol ATR mult /
+    // Pivots to scan / Forward bars / Full span) so the fitted line the gate
+    // reads matches the panel; colours / line width are kept for parity with the
+    // chart indicator's settings panel.
+    pub sup_strength: f64,
+    pub sup_atr_period: f64,
+    pub sup_min_pct: f64,
+    pub sup_tol_mult: f64,
+    pub sup_look: f64,
+    pub sup_fwd: f64,
+    pub sup_full_span: bool,
+    pub sup_up_color: String,
+    pub sup_down_color: String,
+    pub sup_line_width: f64,
+    pub res_strength: f64,
+    pub res_atr_period: f64,
+    pub res_min_pct: f64,
+    pub res_tol_mult: f64,
+    pub res_look: f64,
+    pub res_fwd: f64,
+    pub res_full_span: bool,
+    pub res_up_color: String,
+    pub res_down_color: String,
+    pub res_line_width: f64,
     // --- AST template assignment (Top Movers / NIFTY Trend directions) ---
     /// Default bullish/bearish template chosen in the Template section.
     pub bull_template: String,
@@ -251,6 +332,14 @@ pub struct Settings {
     pub paper_exec_delay_on: bool,
     /// Paper-only entry latency in milliseconds (see `paper_exec_delay_on`).
     pub paper_exec_delay_ms: f64,
+    /// Paper-only exit-latency simulation. When on, a stop / trail-stop /
+    /// target exit is not booked on the triggering tick; it waits
+    /// `paper_exit_delay_ms` (mimicking a real Dhan round-trip) and then books
+    /// at the live mark, so the slippage the delay causes shows in the paper
+    /// P&L. Off = exits book inline exactly as before.
+    pub paper_exit_delay_on: bool,
+    /// Paper-only exit latency in milliseconds (see `paper_exit_delay_on`).
+    pub paper_exit_delay_ms: f64,
     /// Paper-only: place the entry the way Dhan places an F&O order - as a
     /// LIMIT order on the aggressive side of the market (above the price for a
     /// buy, below for a sell) so it is always marketable and fills immediately,
@@ -276,6 +365,7 @@ impl Default for Settings {
             lot_size: 0.0,
             lots: 1.0,
             margin_pct: 100.0,
+            margin_amount: 0.0,
             sl_auto: true,
             tf_1min: false,
             tf_5min: true,
@@ -349,6 +439,33 @@ impl Default for Settings {
             option_side: "both".into(),
             nifty_tf: "5min".into(),
             filters: BTreeMap::new(),
+            sc_min_agree: 0.0,
+            sc_confirm: 0.0,
+            sc_strength: 0.0,
+            sc_up_color: "#00e676".into(),
+            sc_down_color: "#ff5252".into(),
+            sc_flat_color: "#6b6b88".into(),
+            sc_line_width: 2.0,
+            sup_strength: 5.0,
+            sup_atr_period: 14.0,
+            sup_min_pct: 0.05,
+            sup_tol_mult: 0.5,
+            sup_look: 12.0,
+            sup_fwd: 10.0,
+            sup_full_span: false,
+            sup_up_color: "#26a69a".into(),
+            sup_down_color: "#ef5350".into(),
+            sup_line_width: 2.0,
+            res_strength: 5.0,
+            res_atr_period: 14.0,
+            res_min_pct: 0.05,
+            res_tol_mult: 0.5,
+            res_look: 12.0,
+            res_fwd: 10.0,
+            res_full_span: false,
+            res_up_color: "#26a69a".into(),
+            res_down_color: "#ef5350".into(),
+            res_line_width: 2.0,
             bull_template: String::new(),
             bear_template: String::new(),
             mover_bull_template: String::new(),
@@ -368,6 +485,8 @@ impl Default for Settings {
             paper_reject_pct: 0.0,
             paper_exec_delay_on: false,
             paper_exec_delay_ms: 500.0,
+            paper_exit_delay_on: false,
+            paper_exit_delay_ms: 600.0,
             fno_limit_order: false,
             broker_charges: true,
             auto_lot_volume_pct: 1.0,
@@ -409,7 +528,7 @@ pub struct Strategy {
     /// Last time (ms) an entry signal fired; debounces re-entry.
     pub last_signal: i64,
     pub last_error: String,
-    /// Scanner-generated (Top Movers / NIFTY trend / MCX commodity) instrument.
+    /// Scanner-generated (Top Movers / MCX commodity) instrument.
     /// Synthetic rows carry no conditions - the indicator-filter gate is the
     /// entry rule - so the engine does not require a saved strategy for them.
     #[serde(default)]
@@ -814,6 +933,18 @@ fn locked_margin_of(positions: &[Value]) -> (f64, i64) {
     (locked, positions.len() as i64)
 }
 
+/// Margin budget: a manual rupee amount wins when set (`> 0`), capped by the live
+/// available balance; otherwise the operator-set percentage of the balance is
+/// used. `0%` / `0` means no budget configured (the margin gate is disabled).
+fn margin_budget_of(margin_amount: f64, margin_pct: f64, available: f64) -> f64 {
+    let balance = available.max(0.0);
+    if margin_amount > 0.0 {
+        balance.min(margin_amount)
+    } else {
+        balance * margin_pct.clamp(0.0, 100.0) / 100.0
+    }
+}
+
 /// Paper wallet: starting capital + realized P&L - margin locked by the open
 /// paper positions. Derived (never stored) so it can never drift.
 fn paper_available_of(cap: f64, closed: &[Value], positions: &[Value], charges_on: bool) -> f64 {
@@ -896,15 +1027,12 @@ pub struct RealtimeState {
     /// Guards the background Data Pool refresh so the endpoint never blocks the
     /// caller on the ~12 throttled Dhan candle fetches a compute needs.
     pool_busy: Arc<AtomicBool>,
-    /// Latest NIFTY trend direction: 0 unknown, +1 bullish, -1 bearish.
-    nifty_dir: Arc<AtomicI64>,
     /// Latest movers bias: 0 balanced/unknown, +1 gainers lead, -1 losers lead.
     mover_bias: Arc<AtomicI64>,
     /// Last auto-computed Run-in side (0 unknown, +1 CE, -1 PE). When the live
     /// scanners flip it, the picked strikes / strategy legs are re-resolved on
     /// the same pass instead of waiting for the next scheduled scan.
     last_auto_side: Arc<AtomicI64>,
-    last_trend: Arc<AtomicI64>,
     last_movers: Arc<AtomicI64>,
     /// Cached movers rows for the UI `(at_ms, payload)`.
     movers_cache: Arc<Mutex<(i64, Value)>>,
@@ -915,8 +1043,11 @@ pub struct RealtimeState {
     /// in-flight guard so the 100ms scanner never queues the same strategy
     /// twice while its delayed order is still pending.
     paper_pending: Arc<Mutex<HashMap<String, i64>>>,
-    /// Cached NIFTY trend-following picks `(at_ms, payload)`.
-    nifty_picks: Arc<Mutex<(i64, Value)>>,
+    /// Paper-only simulated exit latency: position id -> due ms for exits
+    /// currently queued by `queue_delayed_exit`. Doubles as the in-flight guard
+    /// so the position manager cannot queue the same stop exit twice while its
+    /// delayed order is still pending.
+    paper_exit_pending: Arc<Mutex<HashMap<String, i64>>>,
     /// Cached broker margin-calculator responses `(at_ms, price, Option<resp>)`.
     /// Dhan's margin API is throttled to ~1 call/second, so without this every
     /// option-chain / instrument switch paid that round-trip and the chart load
@@ -933,7 +1064,6 @@ pub struct RealtimeState {
     /// executes the order on - spot strategies fall back to the strategy's own
     /// instrument, so only the resolved premium contracts need caching here.
     strat_legs: Arc<Mutex<HashMap<String, Value>>>,
-    last_nifty_scan: Arc<AtomicI64>,
     /// Entry-timing diagnostics: strategy id -> `(metAt_ms, orders_at_meet)` for
     /// the currently-armed filter-alignment episode.
     et_pending: Arc<Mutex<HashMap<String, (i64, i64)>>>,
@@ -1011,19 +1141,16 @@ impl RealtimeState {
             atr_cache: Arc::new(Mutex::new(HashMap::new())),
             pool_cache: Arc::new(Mutex::new((0, Value::Null))),
             pool_busy: Arc::new(AtomicBool::new(false)),
-            nifty_dir: Arc::new(AtomicI64::new(0)),
             mover_bias: Arc::new(AtomicI64::new(0)),
             last_auto_side: Arc::new(AtomicI64::new(0)),
-            last_trend: Arc::new(AtomicI64::new(0)),
             last_movers: Arc::new(AtomicI64::new(0)),
             movers_cache: Arc::new(Mutex::new((0, Value::Null))),
             order_times: Arc::new(Mutex::new(Vec::new())),
             paper_pending: Arc::new(Mutex::new(HashMap::new())),
-            nifty_picks: Arc::new(Mutex::new((0, Value::Null))),
+            paper_exit_pending: Arc::new(Mutex::new(HashMap::new())),
             margin_cache: Arc::new(Mutex::new(HashMap::new())),
             picked_strikes: Arc::new(Mutex::new((0, Vec::new()))),
             strat_legs: Arc::new(Mutex::new(HashMap::new())),
-            last_nifty_scan: Arc::new(AtomicI64::new(0)),
             et_pending: Arc::new(Mutex::new(HashMap::new())),
             et_placed: Arc::new(AtomicI64::new(0)),
             log_throttle: Arc::new(Mutex::new(HashMap::new())),
@@ -1035,11 +1162,22 @@ impl RealtimeState {
     }
 
     fn save(&self) {
-        if let Ok(d) = self.doc.lock() {
-            if let Ok(s) = serde_json::to_string(&*d) {
-                let _ = write_atomic(&state_path(self.paper), s.as_bytes());
+        // Serialize under the lock (cheap-ish) but NEVER do the disk write while
+        // holding it: the paper state carries the whole closed ledger (multi-MB),
+        // so a slow write under `self.doc` used to stall every snapshot/scan and
+        // made the whole pane feel frozen. Clone the bytes, drop the guard, then
+        // write outside the lock.
+        let bytes = {
+            let d = match self.doc.lock() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            match serde_json::to_string(&*d) {
+                Ok(s) => s,
+                Err(_) => return,
             }
-        }
+        };
+        let _ = write_atomic(&state_path(self.paper), bytes.as_bytes());
     }
 
     fn log(&self, level: &str, msg: &str) {
@@ -1104,6 +1242,24 @@ impl RealtimeState {
             }
         }
         0.0
+    }
+
+    /// Refresh the engine LTP cache from a set of scanner quote rows. Called on
+    /// every `quote_rows` return path so the entry path resolves option strikes
+    /// against the current underlying price. Skipping this on the all-from-feed
+    /// fast path left `ltp` pinned to its startup/pre-open value, which resolved
+    /// far-from-ATM strikes (e.g. a -20% mover's deep-ITM 1900-PE instead of the
+    /// near-ATM leg the readout showed).
+    fn seed_ltp_from_rows(&self, rows: &[Value]) {
+        if let Ok(mut m) = self.ltp.lock() {
+            for r in rows {
+                let id = r.get("securityId").and_then(|x| x.as_i64()).unwrap_or(0);
+                let l = r.get("last").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                if id > 0 && l > 0.0 {
+                    m.insert(id, l);
+                }
+            }
+        }
     }
 
     /// Paper entries are REST-free, so a freshly subscribed leg's first tick can
@@ -1220,16 +1376,16 @@ impl RealtimeState {
             .filter(|v| *v > 0.0)
     }
 
-    /// AI Smart margin budget: the operator-set share (percentage) of the live
-    /// available balance. `0%` (or unknown funds) means no budget configured, so
-    /// the margin gate is disabled; the default `100%` uses the whole wallet.
+    /// AI Smart margin budget: a manual rupee amount when set, else the
+    /// operator-set share (percentage) of the live available balance. `0` / `0%`
+    /// (or unknown funds) means no budget configured, so the margin gate is
+    /// disabled; the default `100%` uses the whole wallet.
     fn margin_budget(&self) -> f64 {
-        let pct = self
+        let (amount, pct) = self
             .doc()
-            .map(|d| d.settings.margin_pct)
-            .unwrap_or(100.0)
-            .clamp(0.0, 100.0);
-        self.available_funds().unwrap_or(0.0) * pct / 100.0
+            .map(|d| (d.settings.margin_amount, d.settings.margin_pct))
+            .unwrap_or((0.0, 100.0));
+        margin_budget_of(amount, pct, self.available_funds().unwrap_or(0.0))
     }
 
     /// Total cost locked by open engine positions (qty x entry), plus the count.
@@ -1253,10 +1409,10 @@ impl RealtimeState {
     /// cloned settings/positions plus the caller-resolved available funds so a
     /// caller holding the doc lock never re-locks it (the paper wallet is derived
     /// from the very same doc snapshot).
-    fn margin_info_from(&self, margin_pct: f64, positions: &[Value], available: f64) -> Value {
+    fn margin_info_from(&self, margin_amount: f64, margin_pct: f64, positions: &[Value], available: f64) -> Value {
         let pct = margin_pct.clamp(0.0, 100.0);
         let balance = available.max(0.0);
-        let budget = balance * pct / 100.0;
+        let budget = margin_budget_of(margin_amount, margin_pct, balance);
         let (locked, count) = locked_margin_of(positions);
         json!({
             "budget": round2(budget),
@@ -1265,6 +1421,7 @@ impl RealtimeState {
             "count": count,
             "configured": budget > 0.0,
             "pct": round2(pct),
+            "amount": round2(margin_amount.max(0.0)),
             "balance": round2(balance),
         })
     }
@@ -1378,15 +1535,13 @@ impl RealtimeState {
             loop {
                 tick.tick().await;
                 // Scanners run whenever their own toggle is ON, independent of the
-                // engine run/arm state, so the Top Movers / NIFTY Trend / commodity
-                // readouts always fetch (old app polled them outside the run gate).
+                // engine run/arm state, so the Top Movers / commodity readouts
+                // always fetch (old app polled them outside the run gate).
                 // Both the real and paper engines behave identically here; each
                 // engine owns its own settings/toggles, so an idle tab only fetches
                 // for scanners the operator enabled on that tab.
-                self.refresh_nifty_trend().await;
                 self.refresh_movers().await;
                 self.sync_auto_side();
-                self.refresh_nifty_scan().await;
                 // Broker account (funds/positions/holdings) and open-position LTP
                 // refresh regardless of run/arm, so the Account view is live
                 // whenever Dhan is connected (the old app fetched account data on
@@ -1666,22 +1821,13 @@ impl RealtimeState {
     }
 
     // -----------------------------------------------------------------------
-    // NIFTY trend + Top Movers scanners (auto CE/PE side)
+    // Top Movers scanner (auto CE/PE side)
     // -----------------------------------------------------------------------
 
-    /// Auto option side from NIFTY trend following and/or movers dominance.
-    /// Returns `None` when neither scanner has a decided direction, so the
+    /// Auto option side from movers dominance.
+    /// Returns `None` when the scanner has not decided a direction, so the
     /// caller falls back to the strategy's own bullish/bearish side.
     fn auto_option_side(&self, settings: &Settings) -> Option<&'static str> {
-        if settings.nifty_trend_on {
-            let d = self.nifty_dir.load(Ordering::Relaxed);
-            if d > 0 {
-                return Some("CE");
-            }
-            if d < 0 {
-                return Some("PE");
-            }
-        }
         if settings.movers_on {
             let b = self.mover_bias.load(Ordering::Relaxed);
             if b > 0 {
@@ -1715,11 +1861,22 @@ impl RealtimeState {
         }
     }
 
+    /// The one side the engine is trading right now: the explicit "Run Strategy
+    /// In" override when it is enabled, else the live scanner direction. Every
+    /// direction decision (which synthetic strategies to build, the Overall
+    /// direction filter, the executed option leg and the readouts) must read this
+    /// single source, otherwise the filter side and the traded contract can
+    /// disagree and an entry fires opposite to the filter that gated it.
+    fn active_side(&self, settings: &Settings) -> Option<&'static str> {
+        self.effective_run_in_side(settings)
+            .or_else(|| self.auto_option_side(settings))
+    }
+
     /// Re-resolve the picked strikes / strategy legs on the same pass whenever
     /// the live auto CE/PE side flips. Without this the scanner readouts kept
-    /// the previous side until their own throttle (15s movers / 60s NIFTY)
-    /// expired, which looked like "Auto Select Mode is stuck" even though the
-    /// direction had already changed.
+    /// the previous side until their own throttle (15s movers) expired, which
+    /// looked like "Auto Select Mode is stuck" even though the direction had
+    /// already changed.
     fn sync_auto_side(&self) {
         let settings = self.doc().map(|d| d.settings.clone()).unwrap_or_default();
         let cur = match self.auto_option_side(&settings) {
@@ -1729,7 +1886,6 @@ impl RealtimeState {
         };
         let prev = self.last_auto_side.swap(cur, Ordering::Relaxed);
         if prev != cur {
-            self.last_nifty_scan.store(0, Ordering::Relaxed);
             self.last_movers.store(0, Ordering::Relaxed);
         }
     }
@@ -1746,7 +1902,7 @@ impl RealtimeState {
             .unwrap_or_else(|| if strategy_is_bull(strat) { "CE".to_string() } else { "PE".to_string() })
     }
 
-    /// Scan universe for the Top Movers / NIFTY trend scanners: the full market
+    /// Scan universe for the Top Movers scanner: the full market
     /// catalog (dropdown symbols + market-watch companies), NIFTY itself and the
     /// operator's strategy symbols. Indices are only included when
     /// `include_indices` is set; MCX commodities only when `include_commodities`
@@ -1755,7 +1911,7 @@ impl RealtimeState {
         let mut out: Vec<(i64, String)> = Vec::new();
         let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
         // Operator-removed scanner picks: an excluded underlying never enters
-        // the universe, so it is neither ranked (Top Movers / NIFTY trend) nor
+        // the universe, so it is neither ranked (Top Movers) nor
         // resolved to an option leg nor traded, until it is restored.
         let excluded: std::collections::HashSet<i64> = self
             .doc()
@@ -1794,52 +1950,6 @@ impl RealtimeState {
             }
         }
         out
-    }
-
-    async fn refresh_nifty_trend(&self) {
-        let now = now_ms();
-        // The ensemble trend is deliberately slow: at most one refresh a minute
-        // (matches the old engine's 60s NIFTY scan cache) so a flickering bar
-        // can never flip the auto CE/PE side mid-trade.
-        if now - self.last_trend.load(Ordering::Relaxed) < 60_000 {
-            return;
-        }
-        let (enabled, tf, conf) = self
-            .doc()
-            .map(|d| (d.settings.nifty_trend_on, d.settings.nifty_tf.clone(), d.settings.nifty_trend_conf_inds.clone()))
-            .unwrap_or((false, "5min".into(), Vec::new()));
-        if !enabled {
-            self.nifty_dir.store(0, Ordering::Relaxed);
-            return;
-        }
-        if !self.dhan.is_connected().await {
-            return;
-        }
-        let tf = if tf.eq_ignore_ascii_case("both") { "5min".to_string() } else { tf };
-        match self.live_candles(NIFTY_SEC, "IDX_I", "INDEX", &tf).await {
-            Ok(c) if c.len() >= 35 => {
-                self.last_trend.store(now, Ordering::Relaxed);
-                let (b, s) = nifty_trend_votes(&c, &conf);
-                let d = if b > s { 1 } else if s > b { -1 } else { 0 };
-                if d != 0 {
-                    let prev = self.nifty_dir.swap(d, Ordering::Relaxed);
-                    if prev != d {
-                        // A trend flip must re-resolve the "Picked Strikes" on the
-                        // new side immediately, not after the next 60s scan (which
-                        // would leave the old side's strikes on screen beside the
-                        // fresh ones).
-                        self.last_nifty_scan.store(0, Ordering::Relaxed);
-                    }
-                }
-                self.log("info", &format!("NIFTY trend {} (bull {b} / bear {s})", if d > 0 { "BULLISH" } else if d < 0 { "BEARISH" } else { "neutral" }));
-            }
-            _ => {
-                // Transient fetch failure / too few candles: retry in ~5s instead
-                // of freezing the direction (and therefore the auto CE/PE side)
-                // for the full 60s window after a reconnect or feed hiccup.
-                self.last_trend.store(now - 55_000, Ordering::Relaxed);
-            }
-        }
     }
 
     /// Build scanner rows for a `(security_id, segment)` universe. Prefers the
@@ -1892,6 +2002,7 @@ impl RealtimeState {
             if rows.is_empty() {
                 self.log("warn", &format!("scanner quote empty for {} ids (feed cache)", univ.len()));
             }
+            self.seed_ltp_from_rows(&rows);
             return rows;
         }
         let Some(client) = self.dhan.session_client().await else {
@@ -1934,15 +2045,7 @@ impl RealtimeState {
         // Seed the engine LTP cache from the poll we just paid for, so the entry
         // path reads the underlying's price here instead of making another
         // throttled quote call before it can resolve the option leg.
-        if let Ok(mut m) = self.ltp.lock() {
-            for r in &rows {
-                let id = r.get("securityId").and_then(|x| x.as_i64()).unwrap_or(0);
-                let l = r.get("last").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                if id > 0 && l > 0.0 {
-                    m.insert(id, l);
-                }
-            }
-        }
+        self.seed_ltp_from_rows(&rows);
         rows
     }
 
@@ -2048,50 +2151,18 @@ impl RealtimeState {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // NIFTY trend-following F&O scanner
-    // -----------------------------------------------------------------------
-
-    fn nifty_pick_underlyings(&self) -> Vec<String> {
-        let picks = self.nifty_picks.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
-        let ids: Vec<i64> = jarr(&picks, "picks").iter().map(|x| ji(x, "securityId")).collect();
-        if ids.is_empty() {
-            return Vec::new();
-        }
-        let mut out: Vec<String> = Vec::new();
-        for id in &ids {
-            if let Some((name, seg, _)) = crate::market::symbol_meta(*id) {
-                out.push(underlying_of(&name, &seg).to_uppercase());
-            }
-        }
-        // Legacy path: saved strategies whose own security id is a live pick.
-        let strategies = self.doc().map(|d| d.strategies.clone()).unwrap_or_default();
-        for s in strategies {
-            if s.security_id > 0 && ids.contains(&s.security_id) {
-                out.push(underlying_of(&s.trading_symbol, &s.exchange_segment).to_uppercase());
-            }
-        }
-        out
-    }
-
     /// Resolve the direction-specific AST template (if assigned) and return its
     /// saved settings, which override the manual gate/filter set for this entry.
     fn template_for_direction(&self, settings: &Settings, strat: &Strategy) -> Option<Settings> {
         let mut name = String::new();
+        // Mirror `auto_option_side` precedence so the resolved template carries
+        // the same side as the strategy set and the executed leg.
         if settings.movers_on {
             let b = self.mover_bias.load(Ordering::Relaxed);
             if b > 0 {
                 name = settings.mover_bull_template.clone();
             } else if b < 0 {
                 name = settings.mover_bear_template.clone();
-            }
-        }
-        if name.is_empty() && settings.nifty_trend_on {
-            let d = self.nifty_dir.load(Ordering::Relaxed);
-            if d > 0 {
-                name = settings.nifty_bull_template.clone();
-            } else if d < 0 {
-                name = settings.nifty_bear_template.clone();
             }
         }
         if name.is_empty() {
@@ -2108,129 +2179,8 @@ impl RealtimeState {
         serde_json::from_value::<Settings>(v.get("settings")?.clone()).ok()
     }
 
-    /// Re-run every 60s: pick F&O stocks whose daily change clears the min %
-    /// threshold and/or the top gainer/loser side of the current NIFTY trend.
-    async fn refresh_nifty_scan(&self) {
-        let now = now_ms();
-        if now - self.last_nifty_scan.load(Ordering::Relaxed) < 60_000 {
-            return;
-        }
-        let (enabled, pct_on, pct, topn, topn_n, inc_idx, idx_list, settings) = self
-            .doc()
-            .map(|d| {
-                (
-                    d.settings.nifty_trend_on,
-                    d.settings.nifty_trend_pct_on,
-                    d.settings.nifty_trend_pct,
-                    d.settings.nifty_trend_topn,
-                    d.settings.nifty_trend_topn_count.max(1),
-                    d.settings.nifty_trend_indices,
-                    d.settings.nifty_trend_index_list.clone(),
-                    d.settings.clone(),
-                )
-            })
-            .unwrap_or((false, true, 2.5, false, 5, false, Vec::new(), Settings::default()));
-        if !enabled || !(pct_on || topn) {
-            self.update_picked("NIFTY trend", Vec::new());
-            return;
-        }
-        if !self.dhan.is_connected().await {
-            return;
-        }
-        self.last_nifty_scan.store(now, Ordering::Relaxed);
-        let commodity_on = self.doc().map(|d| d.settings.commodity_on).unwrap_or(false);
-        let mut univ: Vec<(i64, String)> = self.scan_universe(inc_idx, commodity_on);
-        if inc_idx {
-            // Index legs use the IDX_I quote key, same as the movers scanner -
-            // NSE_EQ would never resolve an index LTP.
-            univ.extend(index_legs(&idx_list));
-        }
-        univ.sort();
-        univ.dedup();
-        let rows: Vec<Value> = self.quote_rows(&univ).await;
-        let dir = self.nifty_dir.load(Ordering::Relaxed);
-        let mut qual: Vec<Value> = rows
-            .iter()
-            .filter(|r| !pct_on || jf(r, "changePct").abs() >= pct)
-            .cloned()
-            .collect();
-        if dir < 0 && topn {
-            qual.sort_by(|a, b| jf(a, "changePct").partial_cmp(&jf(b, "changePct")).unwrap_or(std::cmp::Ordering::Equal));
-        } else {
-            qual.sort_by(|a, b| jf(b, "changePct").partial_cmp(&jf(a, "changePct")).unwrap_or(std::cmp::Ordering::Equal));
-        }
-        let picks: Vec<Value> = if topn {
-            qual.into_iter().take(topn_n as usize).collect()
-        } else {
-            qual
-        };
-        let payload = json!({
-            "ok": true, "at": now, "dir": dir, "pctOn": pct_on, "pct": pct,
-            "topn": topn, "topnCount": topn_n, "picks": picks,
-        });
-        // Resolve the option leg the engine will execute for every pick and cache
-        // it for the "Picked Strikes" readout - populated as soon as NIFTY trend
-        // is ON, before any entry actually fires.
-        let leg_side = self.pick_side(&settings);
-        let legs: Vec<Value> = picks
-            .iter()
-            .filter_map(|r| {
-                let sid = ji(r, "securityId");
-                let spot = jf(r, "last");
-                let (name, seg, inst) = crate::market::symbol_meta(sid)?;
-                self.pick_leg(&settings, sid, &name, &seg, &inst, spot, &leg_side).map(|leg| {
-                    json!({
-                        "securityId": leg.security_id,
-                        "underlying": name,
-                        "side": leg_side,
-                        "tradingSymbol": leg.trading_symbol,
-                        "segment": leg.exchange_segment,
-                        "instrument": leg.instrument,
-                        "spot": round2(spot),
-                        "changePct": jf(r, "changePct"),
-                        "source": "NIFTY trend",
-                        "runMode": run_mode_for(&seg, &inst, &settings),
-                        "underlyingSecurityId": sid,
-                        "underlyingSegment": seg,
-                        "underlyingInstrument": inst,
-                    })
-                })
-            })
-            .collect();
-        self.update_picked("NIFTY trend", legs);
-        if let Ok(mut g) = self.nifty_picks.lock() {
-            *g = (now, payload);
-        }
-        // A picked stock that stops qualifying is dropped immediately: close any
-        // open position originally tagged as a NIFTY-trend pick.
-        let keep = self.nifty_pick_underlyings();
-        let drops: Vec<String> = self
-            .doc()
-            .map(|d| {
-                d.positions
-                    .iter()
-                    .filter(|p| jb(p, "niftyPick") && !keep.contains(&js(p, "underlying").to_uppercase()))
-                    .map(|p| js(p, "id"))
-                    .collect()
-            })
-            .unwrap_or_default();
-        for id in drops {
-            let ltp = self.position_ltp(&id);
-            let _ = self.close_position(&id, "nifty_pick_drop", ltp).await;
-        }
-    }
-
-    async fn nifty_readout(&self) -> Value {
-        let (at, payload) = self.nifty_picks.lock().map(|g| (g.0, g.1.clone())).unwrap_or((0, Value::Null));
-        if payload.is_object() {
-            payload
-        } else {
-            json!({ "ok": true, "at": at, "dir": self.nifty_dir.load(Ordering::Relaxed), "picks": [] })
-        }
-    }
-
     // -----------------------------------------------------------------------
-    // Scanner-driven instruments (Top Movers / NIFTY trend / MCX commodities)
+    // Scanner-driven instruments (Top Movers / MCX commodities)
     // -----------------------------------------------------------------------
     //
     // The scanners decide *what* to trade; the indicator-filter gate decides
@@ -2273,15 +2223,11 @@ impl RealtimeState {
     /// CE/PE side a scanner pick resolves to from the live NIFTY direction /
     /// "Run Strategy In" preference (defaults to CE when neither is decided).
     fn pick_side(&self, settings: &Settings) -> String {
-        if let Some(side) = self.effective_run_in_side(settings) {
-            return side.to_string();
-        }
-        self.auto_option_side(settings).map(|s| s.to_string()).unwrap_or_else(|| "CE".into())
+        self.active_side(settings).unwrap_or("CE").to_string()
     }
 
     /// Replace the "Picked Strikes" rows belonging to one scanner `source`,
-    /// keeping the other scanner's rows intact (NIFTY trend + Top Movers both
-    /// feed the same readout).
+    /// keeping the other scanner's rows intact (Top Movers feeds this readout).
     fn update_picked(&self, source: &str, rows: Vec<Value>) {
         if let Ok(mut g) = self.picked_strikes.lock() {
             g.1.retain(|r| js(r, "source") != source);
@@ -2321,9 +2267,8 @@ impl RealtimeState {
         if !bull_side && !bear_side {
             return Vec::new();
         }
-        let auto = self.auto_option_side(settings);
-        let allow_bull = bull_side && auto.map(|s| s == "CE").unwrap_or(true);
-        let allow_bear = bear_side && auto.map(|s| s == "PE").unwrap_or(true);
+        let active = self.active_side(settings);
+        let (allow_bull, allow_bear) = side_allowed(bull_side, bear_side, active);
         if !allow_bull && !allow_bear {
             return Vec::new();
         }
@@ -2422,25 +2367,6 @@ impl RealtimeState {
             }
         }
 
-        // NIFTY trend-following: the ensemble direction forces the side.
-        if settings.nifty_trend_on {
-            let dir = self.nifty_dir.load(Ordering::Relaxed);
-            let force = if dir > 0 {
-                Some(true)
-            } else if dir < 0 {
-                Some(false)
-            } else {
-                None
-            };
-            let payload = self.nifty_picks.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
-            for r in jarr(&payload, "picks") {
-                add(&mut out, &mut seen, ji(&r, "securityId"), force, allow_bull, allow_bear);
-            }
-            for id in &settings.nifty_trend_index_list {
-                add(&mut out, &mut seen, *id, force, allow_bull, allow_bear);
-            }
-        }
-
         out
     }
 
@@ -2451,7 +2377,7 @@ impl RealtimeState {
     async fn scan_signals(&self) {        if !self.dhan.is_connected().await {
             return;
         }
-        let (mut strategies, selected, trade_limit, trade_limit_count, ai_trades, movers_on, nifty_on, settings0) = {
+        let (mut strategies, selected, trade_limit, trade_limit_count, ai_trades, movers_on, settings0) = {
             let Some(d) = self.doc() else { return };
             if !d.strategy_time_ok() {
                 return;
@@ -2463,11 +2389,10 @@ impl RealtimeState {
                 d.settings.trade_limit_count.max(0),
                 d.settings.ai_trades,
                 d.settings.movers_on,
-                d.settings.nifty_trend_on,
                 d.settings.clone(),
             )
         };
-        // Scanner-picked instruments (Top Movers / NIFTY trend / MCX commodities)
+        // Scanner-picked instruments (Top Movers / MCX commodities)
         // join the run set as synthetic strategies so the indicator-filter gate +
         // Dhan execution path below drives real trades for them too.
         strategies.extend(self.scanner_targets(&settings0));
@@ -2485,7 +2410,8 @@ impl RealtimeState {
         // enabled / AI-picked strategies (their own entry conditions, with the
         // indicator filters acting as extra gates). Indicator-filters mode runs
         // ONLY the scanner-universe synthetic strategies - their entry rule is
-        // the ticked indicator filters, applied strictly (all together). The two
+        // the ticked indicator filters, gated by majority (or strict AND / AI
+        // Brain when those are enabled). The two
         // sets are mutually exclusive, exactly like the old engine.
         let filter_mode = settings0.filter_mode;
         // A strategy runs when enabled / manually ticked / AI-picked, and the
@@ -2500,19 +2426,19 @@ impl RealtimeState {
             .iter()
             .filter(|s| in_run(s) && s.security_id > 0 && (!s.conditions.is_empty() || s.synthetic))
             .count();
-        if eligible == 0 && !movers_on && !nifty_on && !commodity_on {
+        if eligible == 0 && !movers_on && !commodity_on {
             self.log_throttled(
                 "no-instruments",
                 15_000,
                 "warn",
-                "No tradeable instruments resolved - open a chart symbol, enable Top Movers, NIFTY trend-following or Commodities, and tick at least one indicator filter",
+                "No tradeable instruments resolved - open a chart symbol, enable Top Movers or Commodities, and tick at least one indicator filter",
             );
         }
         self.log_throttled(
             "scan-diag",
             15_000,
             "info",
-            &format!("scan pass: {} strategies, {} eligible, filter_mode={} movers={} nifty={} comm={}", strategies.len(), eligible, filter_mode, movers_on, nifty_on, commodity_on),
+            &format!("scan pass: {} strategies, {} eligible, filter_mode={} movers={} comm={}", strategies.len(), eligible, filter_mode, movers_on, commodity_on),
         );
         for mut strat in strategies {
             if !in_run(&strat) || strat.security_id <= 0 || (strat.conditions.is_empty() && !strat.synthetic) {
@@ -2591,7 +2517,7 @@ impl RealtimeState {
             // Overall Bullish/Bearish idea: when on, only the overall direction's
             // side is traded (NIFTY trend / top-movers decide the overall side).
             if settings.overall_dir {
-                if let Some(side) = self.auto_option_side(&settings) {
+                if let Some(side) = self.active_side(&settings) {
                     let want_bull = side == "CE";
                     if strategy_is_bull(&strat) != want_bull {
                         continue;
@@ -3127,6 +3053,20 @@ impl RealtimeState {
                 } else {
                     ltp
                 };
+                // Paper-only exit latency: when enabled, the exit is not booked
+                // on the triggering tick. It is queued and lands `paper_exit_delay_ms`
+                // later at the SAME level it would have booked without the delay
+                // (stop -> stop level, trail -> trail level, target -> target), so
+                // the delay only postpones the cut and never re-prices it. (Re-pricing
+                // to the live mark turned profit-locking trail exits into losses.)
+                let (exit_delay_on, exit_delay_ms) = self
+                    .doc()
+                    .map(|d| (d.settings.paper_exit_delay_on, d.settings.paper_exit_delay_ms))
+                    .unwrap_or((false, 0.0));
+                if self.paper && exit_delay_on && exit_delay_ms > 0.0 {
+                    self.queue_delayed_exit(&id, reason, exit_px, exit_delay_ms);
+                    continue;
+                }
                 if let Err(e) = self.close_position(&id, reason, exit_px).await {
                     self.log("error", &format!("exit {id} failed: {e}"));
                 }
@@ -3457,6 +3397,30 @@ impl RealtimeState {
         out.instrument = if scrip::is_index_prefix(&prefix) { "OPTIDX" } else { "OPTSTK" }.to_string();
         out.trading_symbol = res.trading_symbol;
         Some(out)
+    }
+
+    /// Whether an option's own premium is consistent with the underlying: a long
+    /// option can never be worth less than its intrinsic value, so a print below
+    /// intrinsic means the option feed (or the underlying's) is stale/crossed and
+    /// must not be filled. The 2% slack absorbs the underlying's own last-trade
+    /// lag without letting a genuinely stale premium through. Fails open for
+    /// non-options, unknown symbols or a missing underlying quote.
+    fn option_premium_sane(&self, opt: &Strategy, premium: f64) -> bool {
+        if premium <= 0.0 {
+            return false;
+        }
+        let Some((strike, ot)) = option_strike_type(&opt.trading_symbol) else { return true };
+        let Some(und) = underlying_strategy(opt) else { return true };
+        let spot = self.ltp_of(und.security_id, &und.exchange_segment);
+        if spot <= 0.0 {
+            return true;
+        }
+        let intrinsic = if ot.eq_ignore_ascii_case("PE") {
+            (strike - spot).max(0.0)
+        } else {
+            (spot - strike).max(0.0)
+        };
+        premium >= intrinsic * 0.98
     }
 
     /// Resolve the option leg, then apply the NIFTY strike preferences:
@@ -3799,6 +3763,54 @@ impl RealtimeState {
         });
     }
 
+    /// Paper-only simulated exit latency.
+    ///
+    /// Queues a stop / trail-stop / target exit and books it `delay_ms` after
+    /// the level first triggered, at the SAME `exit_px` the exit would have
+    /// booked without the delay (stop -> stop level, trail -> trail level,
+    /// target -> target). The delay only postpones the cut; it never re-prices
+    /// it, so the paper P&L semantics stay identical to delay-off. While the
+    /// exit is in flight the position id stays in `paper_exit_pending`, so the
+    /// position manager cannot queue the same exit twice; it is removed once
+    /// resolved. Disabling the feature means this is never called.
+    fn queue_delayed_exit(&self, id: &str, reason: &str, exit_px: f64, delay_ms: f64) {
+        let due = now_ms() + delay_ms.max(0.0) as i64;
+        {
+            let Ok(mut m) = self.paper_exit_pending.lock() else { return };
+            if m.contains_key(id) {
+                return;
+            }
+            m.insert(id.to_string(), due);
+        }
+        let me = self.clone();
+        let id = id.to_string();
+        let reason = reason.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms.max(0.0) as u64)).await;
+            let open = me
+                .doc()
+                .map(|d| d.positions.iter().any(|p| js(p, "id") == id))
+                .unwrap_or(false);
+            if open {
+                match me.close_position(&id, &reason, exit_px).await {
+                    Ok(()) => me.log_throttled(
+                        &format!("delay-exit:{id}"),
+                        5_000,
+                        "info",
+                        &format!(
+                            "paper delayed EXIT {reason} (+{:.0}ms) booked at {:.2}",
+                            delay_ms, exit_px
+                        ),
+                    ),
+                    Err(e) => me.log("error", &format!("delayed exit {id} failed: {e}")),
+                }
+            }
+            if let Ok(mut m) = me.paper_exit_pending.lock() {
+                m.remove(&id);
+            }
+        });
+    }
+
     async fn open_entry(&self, strat: &Strategy) -> Result<(), String> {
         let (mut settings, method, auto_lots, cfg) = {
             let Some(d) = self.doc() else { return Err("state lock".into()) };
@@ -3885,6 +3897,15 @@ impl RealtimeState {
                 }
             }
         }
+        // Phantom-profit guard: a long option is never worth less than its
+        // intrinsic value, so a premium below intrinsic means the option's feed
+        // print (or the underlying's) is stale or crossed. Booking an entry on
+        // such a print is exactly what produced fake deep-ITM profits - filled at
+        // a stale-low premium, then exited at the true higher one when the next
+        // print landed. Skip the entry instead of trading on an inconsistent LTP.
+        if option_strike_type(&strat.trading_symbol).is_some() && !self.option_premium_sane(&strat, ltp) {
+            return Err("stale option LTP (premium below intrinsic); entry skipped".into());
+        }
         // Publish the exact contract this entry executes on (option premium for
         // index/F&O, or the strategy's own spot) for the Running Strategies view.
         self.record_strat_leg(&strat.id, "trade", &strat);
@@ -3951,7 +3972,7 @@ impl RealtimeState {
         let underlying = underlying_of(&strat.trading_symbol, &exch);
         let freeze = scrip::freeze_qty(strat.security_id, &underlying);
         let cfg = cfg.get(&method).cloned().unwrap_or(json!({}));
-        let corr = format!("rt-{}", strat.id);
+        let corr = corr_id(&strat.id);
 
         // AI stop/target from recent volatility (ATR) when any AI risk mode is on;
         // `levels_for` then applies the exact precedence: RR > Manual Trail TP >
@@ -4152,10 +4173,6 @@ impl RealtimeState {
             .subscribe_options(&[(strat.security_id, exch.clone())])
             .await;
 
-        // Tag entries that come from a NIFTY trend-following pick so they can be
-        // dropped the moment the stock stops qualifying.
-        let nifty_pick = settings.nifty_trend_on
-            && self.nifty_pick_underlyings().contains(&underlying.to_uppercase());
         let pos_id = gen_id("rtpos");
         let position = json!({
             "id": pos_id,
@@ -4187,7 +4204,7 @@ impl RealtimeState {
             "superOrders": super_orders,
             "broker": broker,
             "reconciled": false,
-            "niftyPick": nifty_pick,
+            "niftyPick": false,
             "status": "running",
             "orderType": if fno_limit_px > 0.0 { "FNO_LIMIT" } else { "MARKET" },
             "limitPrice": fno_limit_px,
@@ -4299,7 +4316,7 @@ impl RealtimeState {
             let exit_side = if is_buy { "SELL" } else { "BUY" };
             let req = OrderRequest {
                 dhan_client_id: client_id,
-                correlation_id: Some(format!("rt-exit-{id}")),
+                correlation_id: Some(corr_id(&format!("exit{id}"))),
                 transaction_type: txn(exit_side),
                 exchange_segment: seg_from(&exch),
                 product_type: product_from(cfg_str(&cfg, "product", "INTRADAY")),
@@ -4470,7 +4487,7 @@ impl RealtimeState {
             let qty = residual.abs();
             let req = OrderRequest {
                 dhan_client_id: client_id.clone(),
-                correlation_id: Some(format!("rt-sqoff-{sid}")),
+                correlation_id: Some(corr_id(&format!("sq{sid}"))),
                 transaction_type: txn(side),
                 exchange_segment: seg_from(&seg),
                 product_type: product_from(&product),
@@ -5133,8 +5150,150 @@ fn sl_series(base: &str) -> Option<(&'static str, usize)> {
         "GannFan" => ("gant", 0),
         "FibFan" => ("fibt", 0),
         "Srema" => ("sremat", 0),
+        "Support" => ("supline", 0),
+        "Resistance" => ("resline", 0),
         _ => return None,
     })
+}
+
+/// Straight Line Consensus gate: majority vote of the twelve straight-line
+/// indicators (see `algo_core::indicators::sl_consensus_dir`). `offset` bars
+/// back; a bar before the consensus resolves returns `None` so the caller treats
+/// it as non-blocking, exactly like the other straight-line gates.
+#[derive(Clone, Copy)]
+struct ConsensusCfg {
+    need: i32,
+    confirm: usize,
+    strength: f64,
+}
+
+impl Default for ConsensusCfg {
+    fn default() -> Self {
+        // Chart-indicator defaults (structural gating on).
+        ConsensusCfg { need: 2, confirm: 5, strength: 5.0 }
+    }
+}
+
+/// Indicator-filter settings for the Consensus filter rows. Defaults are 0 so
+/// that the filter flips the instant the vote flips (no confirm wait, no
+/// structural gate), exactly as configured in the filter settings panel.
+fn consensus_cfg(settings: &Settings) -> ConsensusCfg {
+    let need = settings.sc_min_agree.round() as i32;
+    let confirm = settings.sc_confirm.round().max(0.0) as usize;
+    let strength = settings.sc_strength;
+    ConsensusCfg { need, confirm, strength }
+}
+
+/// Indicator-filter settings for the Support / Resistance Trendline filter rows.
+/// Mirrors the geometry inputs of the `supline` / `resline` chart indicators so
+/// the fitted line the gate reads is exactly the line the panel describes.
+#[derive(Clone, Copy)]
+struct PivotTrendCfg {
+    strength: f64,
+    atr_period: f64,
+    min_pct: f64,
+    tol_mult: f64,
+    look: f64,
+    fwd: f64,
+    full_span: bool,
+}
+
+impl Default for PivotTrendCfg {
+    fn default() -> Self {
+        // Chart-indicator defaults (matches the registry `supline` / `resline`).
+        PivotTrendCfg {
+            strength: 5.0,
+            atr_period: 14.0,
+            min_pct: 0.05,
+            tol_mult: 0.5,
+            look: 12.0,
+            fwd: 10.0,
+            full_span: false,
+        }
+    }
+}
+
+impl PivotTrendCfg {
+    fn to_settings(self) -> algo_core::model::Settings {
+        let mut st = algo_core::model::Settings::new();
+        st.insert("strength".into(), json!(self.strength));
+        st.insert("atrPeriod".into(), json!(self.atr_period));
+        st.insert("minPct".into(), json!(self.min_pct));
+        st.insert("tolMult".into(), json!(self.tol_mult));
+        st.insert("look".into(), json!(self.look));
+        st.insert("fwd".into(), json!(self.fwd));
+        st.insert("fullSpan".into(), json!(self.full_span));
+        st
+    }
+}
+
+fn support_trend_cfg(settings: &Settings) -> PivotTrendCfg {
+    PivotTrendCfg {
+        strength: settings.sup_strength,
+        atr_period: settings.sup_atr_period,
+        min_pct: settings.sup_min_pct,
+        tol_mult: settings.sup_tol_mult,
+        look: settings.sup_look,
+        fwd: settings.sup_fwd,
+        full_span: settings.sup_full_span,
+    }
+}
+
+fn resistance_trend_cfg(settings: &Settings) -> PivotTrendCfg {
+    PivotTrendCfg {
+        strength: settings.res_strength,
+        atr_period: settings.res_atr_period,
+        min_pct: settings.res_min_pct,
+        tol_mult: settings.res_tol_mult,
+        look: settings.res_look,
+        fwd: settings.res_fwd,
+        full_span: settings.res_full_span,
+    }
+}
+
+/// Direction of a trendline (`supline` / `resline`) fitted with the filter's own
+/// geometry settings: `Some(true)` = rising, `Some(false)` = falling. `None` when
+/// the line is not drawn yet, so the caller treats it as non-blocking exactly
+/// like the other straight-line gates.
+fn trend_line_dir(id: &str, cfg: PivotTrendCfg, bull: bool, candles: &[Candle], offset: usize) -> Option<bool> {
+    let st = cfg.to_settings();
+    let out = ind_series(id, candles, &st);
+    let s = out.first()?;
+    let a = series_value(s, offset)?;
+    let b = series_value(s, offset + 1)?;
+    Some(if bull { a > b } else { a < b })
+}
+
+fn sl_consensus_at(candles: &[Candle], offset: usize, sc: ConsensusCfg) -> Option<i32> {
+    let dirs = algo_core::indicators::sl_consensus_dir(candles, sc.need, sc.confirm, sc.strength);
+    let n = dirs.len();
+    if n <= offset {
+        return None;
+    }
+    Some(dirs[n - 1 - offset])
+}
+
+fn sl_consensus_ok(bull: bool, candles: &[Candle], offset: usize, sc: ConsensusCfg) -> bool {
+    match sl_consensus_at(candles, offset, sc) {
+        Some(d) => {
+            if bull {
+                d >= 0
+            } else {
+                d <= 0
+            }
+        }
+        None => true,
+    }
+}
+
+fn sl_consensus_flip(bull: bool, candles: &[Candle], offset: usize, sc: ConsensusCfg) -> bool {
+    let now = match sl_consensus_at(candles, offset, sc) {
+        Some(d) => d,
+        None => return true,
+    };
+    let prev = sl_consensus_at(candles, offset + 1, sc);
+    let want = if bull { 1 } else { -1 };
+    now == want && prev != Some(want)
 }
 
 /// Fresh trend-start arrow for one line: `true` only on the bar where the line's
@@ -5159,7 +5318,10 @@ fn arrow_flip(id: &str, idx: usize, bull: bool, candles: &[Candle], offset: usiz
 /// selected indicator. `Oit` uses the OI-Trend regime line, `TrendCore` the
 /// Trend Core overlay, `Vl` the Volume Line; everything else maps through the
 /// straight-line catalogue.
-fn arrow_gate(rest: &str, bull: bool, candles: &[Candle], offset: usize) -> Option<bool> {
+fn arrow_gate(rest: &str, bull: bool, candles: &[Candle], offset: usize, sc: ConsensusCfg) -> Option<bool> {
+    if rest == "Consensus" {
+        return Some(sl_consensus_flip(bull, candles, offset, sc));
+    }
     if rest == "Oit" {
         return Some(match oit_dir(bull, candles, offset) {
             Some(now) => {
@@ -5173,7 +5335,7 @@ fn arrow_gate(rest: &str, bull: bool, candles: &[Candle], offset: usize) -> Opti
     // change never fires and their arrow filter could never trade. Detect the
     // trend-start on the ATR zigzag structure instead - the same structure the
     // chart arrow for these indicators is drawn from.
-    if matches!(rest, "Srema" | "AutoTrendline" | "Pitchfork" | "TrendProjection" | "GannFan" | "FibFan") {
+    if matches!(rest, "Srema" | "AutoTrendline" | "Pitchfork" | "TrendProjection" | "GannFan" | "FibFan" | "Support" | "Resistance") {
         return algo_core::indicators::trend_flip_at(candles, offset, bull, 5.0);
     }
     let (id, idx) = if rest == "TrendCore" {
@@ -5562,6 +5724,17 @@ fn asr_gap_rising(bull: bool, candles: &[Candle], offset: usize) -> Option<bool>
 /// Evaluate one filter toggle. `None` means "no implementation / research
 /// stream" and is treated as non-blocking by the gate.
 fn filter_eval(key: &str, candles: &[Candle], offset: usize) -> Option<bool> {
+    filter_eval_inner(key, candles, offset, ConsensusCfg::default(), PivotTrendCfg::default(), PivotTrendCfg::default())
+}
+
+fn filter_eval_inner(
+    key: &str,
+    candles: &[Candle],
+    offset: usize,
+    sc: ConsensusCfg,
+    sup: PivotTrendCfg,
+    res: PivotTrendCfg,
+) -> Option<bool> {
     let (bull, base) = if let Some(b) = key.strip_prefix("Bull") {
         (true, b)
     } else if let Some(b) = key.strip_prefix("Bear") {
@@ -5691,7 +5864,7 @@ fn filter_eval(key: &str, candles: &[Candle], offset: usize) -> Option<bool> {
         _ => {
             // Fresh up/down arrow on a straight-line / overlay indicator.
             if let Some(rest) = base.strip_prefix("Arrow") {
-                return arrow_gate(rest, bull, candles, offset);
+                return arrow_gate(rest, bull, candles, offset, sc);
             }
             if let Some(rest) = base.strip_prefix("St10_") {
                 if let Some((lo, hi)) = parse_pair(rest) {
@@ -5729,6 +5902,18 @@ fn filter_eval(key: &str, candles: &[Candle], offset: usize) -> Option<bool> {
             // A structural line that is not drawn yet (no resolved pivots) is
             // non-blocking, matching the old engine's "uncomputable => neutral".
             if let Some(rest) = base.strip_prefix("Sl") {
+                if rest == "Consensus" {
+                    return Some(sl_consensus_ok(bull, candles, offset, sc));
+                }
+                // Support / Resistance Trendline filters read the panel's own
+                // geometry settings, so the fitted line the gate sees is the
+                // line the operator configured.
+                if rest == "Support" {
+                    return Some(trend_line_dir("supline", sup, bull, candles, offset).unwrap_or(true));
+                }
+                if rest == "Resistance" {
+                    return Some(trend_line_dir("resline", res, bull, candles, offset).unwrap_or(true));
+                }
                 if let Some((id, idx)) = sl_series(rest) {
                     return Some(series_dir(id, &[], idx, bull, candles, offset).unwrap_or(true));
                 }
@@ -5788,6 +5973,18 @@ fn filter_is_bear(k: &str) -> bool {
     } else {
         k.to_uppercase().contains("DOWN")
     }
+}
+
+/// Which sides the scanner may build strategies for. A side that has no
+/// matching filters can never be gated, so it must not be allowed; and when the
+/// engine has committed to one trade side (explicit "Run Strategy In" override,
+/// else the live scanner direction) only that side may run. This keeps the side
+/// the filters gate identical to the side the option leg executes, so a bearish
+/// filter can never fire a CE entry (and vice versa).
+fn side_allowed(bull_side: bool, bear_side: bool, active: Option<&str>) -> (bool, bool) {
+    let allow_bull = bull_side && active.map(|s| s == "CE").unwrap_or(true);
+    let allow_bear = bear_side && active.map(|s| s == "PE").unwrap_or(true);
+    (allow_bull, allow_bear)
 }
 
 /// "Arrow Detection" toggle (`BullArrow*` / `BearArrow*`). These are collapsed
@@ -5882,12 +6079,14 @@ struct GateFacts {
 /// Indicator-filter gate for one side. Every enabled entry-gate mechanism is
 /// combined with a strict AND, so they can all run together and none silently
 /// disables another:
-///   * "All together (strict AND)" / Indicator-filters run mode -> every enabled
-///     filter on the strategy's side must pass.
+///   * "All together (strict AND)" -> every enabled filter on the strategy's
+///     side must pass. This is gated ONLY by the checkbox; the Indicator-filters
+///     run mode does NOT by itself force strict AND.
 ///   * AI Brain AUTO (score + conflict veto) -> the weighted own-side confluence
 ///     must also reach the threshold, and a strongly-opposite filter set (at
 ///     least half of that side's enabled filters agreeing) vetoes the entry.
-/// With no strict AND and no Brain, a majority of the enabled filters suffices.
+/// Without strict AND the gate falls back to a majority of the enabled filters
+/// (subject to Brain when it is enabled).
 fn filter_gate(settings: &Settings, strat: &Strategy, candles: &[Candle], offset: usize) -> bool {
     filter_gate_facts(settings, strat, candles, offset).0
 }
@@ -5899,6 +6098,9 @@ fn filter_gate_facts(settings: &Settings, strat: &Strategy, candles: &[Candle], 
     // engine's entry decision.
     let _sc = IndScope::enter();
     let bull = strategy_is_bull(strat);
+    let cons = consensus_cfg(settings);
+    let sup = support_trend_cfg(settings);
+    let res = resistance_trend_cfg(settings);
     let side_keys: Vec<&String> = settings
         .filters
         .iter()
@@ -5915,14 +6117,14 @@ fn filter_gate_facts(settings: &Settings, strat: &Strategy, candles: &[Candle], 
     let arrow_pass = if arrow_keys.is_empty() {
         None
     } else {
-        Some(arrow_keys.iter().any(|k| filter_eval(k, candles, offset).unwrap_or(true)))
+        Some(arrow_keys.iter().any(|k| filter_eval_inner(k, candles, offset, cons, sup, res).unwrap_or(true)))
     };
     let mut f = GateFacts {
         total: norm_keys.len() + usize::from(arrow_pass.is_some()),
         ..Default::default()
     };
     for k in &norm_keys {
-        if filter_eval(k, candles, offset).unwrap_or(true) {
+        if filter_eval_inner(k, candles, offset, cons, sup, res).unwrap_or(true) {
             f.pass += 1;
         }
     }
@@ -5938,14 +6140,16 @@ fn filter_gate_facts(settings: &Settings, strat: &Strategy, candles: &[Candle], 
             continue;
         }
         f.opp_total += 1;
-        if filter_eval(k, candles, offset) == Some(true) {
+        if filter_eval_inner(k, candles, offset, cons, sup, res) == Some(true) {
             f.opposite += 1;
         }
     }
-    // "All together (strict AND)" (and the Indicator-filters run mode, which is
-    // the same strict contract) requires every enabled filter on the strategy's
-    // side to pass. With no enabled filters the gate is non-blocking.
-    f.strict = settings.filter_mode || settings.all_in_one;
+    // "All together (strict AND)" requires every enabled filter on the
+    // strategy's side to pass. The Indicator-filters run mode alone does NOT
+    // force strict AND; without the checkbox a majority of the enabled filters
+    // drives the entry (Brain, when enabled, still layers on top below). With no
+    // enabled filters the gate is non-blocking.
+    f.strict = settings.all_in_one;
     if f.strict && f.pass != f.total {
         return (false, f);
     }
@@ -6067,6 +6271,19 @@ fn trade_mode_of(_strat: &Strategy, _s: &Settings) -> String {
     "premium".into()
 }
 
+/// Parse the strike and option type out of a resolved option contract symbol
+/// such as `POLICYBZR-Sep2026-1900-PE` (the last two `-` separated fields).
+/// Returns `None` for anything that is not a CE/PE option leg.
+fn option_strike_type(symbol: &str) -> Option<(f64, &str)> {
+    let mut it = symbol.rsplit('-');
+    let ot = it.next()?;
+    if !(ot.eq_ignore_ascii_case("CE") || ot.eq_ignore_ascii_case("PE")) {
+        return None;
+    }
+    let strike: f64 = it.next()?.trim().parse().ok()?;
+    Some((strike, ot))
+}
+
 /// Map an option leg (`OPTIDX`/`OPTSTK`/`OPTFUT`, or any `*_FNO` segment) back
 /// to its underlying spot instrument. "Run Strategy In: Spot chart" must
 /// evaluate the entry conditions on the underlying spot chart, not the option's
@@ -6150,10 +6367,6 @@ fn fno_segment(exch: &str) -> &'static str {
     }
 }
 
-/// NIFTY spot security id (IDX_I) used by the trend-following scanner.
-const NIFTY_SEC: i64 = 13;
-
-/// Ensemble trend vote for the NIFTY trend-following scanner: EMA ladder,
 /// Auto CE/PE bias for the Top Movers scanner (old AST `autoRunInSide` parity).
 /// Classifies the ACTUAL traded universe - the operator's selected top gainers
 /// / top losers - rather than whole-market breadth, so switching the selection
@@ -6180,56 +6393,6 @@ fn movers_auto_bias(want_g: bool, want_l: bool, pos: i64, neg: i64, up: i64, dow
     } else {
         0
     }
-}
-
-/// Supertrend(10,3), close-vs-VWAP, EMA9 slope plus the user-picked confirm
-/// indicators (each contributes one rising/falling vote). Returns
-/// `(bullish_votes, bearish_votes)`.
-fn nifty_trend_votes(candles: &[Candle], conf: &[String]) -> (i32, i32) {
-    let mut bull = 0i32;
-    let mut bear = 0i32;
-    if let (Some(a), Some(b), Some(c)) = (ema_val(9, candles, 0), ema_val(21, candles, 0), ema_val(35, candles, 0)) {
-        if a > b && b > c {
-            bull += 1;
-        } else if a < b && b < c {
-            bear += 1;
-        }
-    }
-    if let (Some(c), Some(st)) = (close_at(candles, 0), st_val(3.0, candles, 0)) {
-        if c > st {
-            bull += 1;
-        } else {
-            bear += 1;
-        }
-    }
-    if let (Some(c), Some(v)) = (close_at(candles, 0), ind_at("vwap", candles, &[], 0)) {
-        if c > v {
-            bull += 1;
-        } else {
-            bear += 1;
-        }
-    }
-    if let (Some(a), Some(b)) = (ema_val(9, candles, 0), ema_val(9, candles, 1)) {
-        if a > b {
-            bull += 1;
-        } else if a < b {
-            bear += 1;
-        }
-    }
-    for id in conf {
-        let st: algo_core::model::Settings = Default::default();
-        let out = algo_core::compute(id, candles, &st);
-        if let Some(s) = out.first() {
-            if let (Some(v0), Some(v1)) = (series_value(s, 0), series_value(s, 1)) {
-                if v0 > v1 {
-                    bull += 1;
-                } else if v0 < v1 {
-                    bear += 1;
-                }
-            }
-        }
-    }
-    (bull, bear)
 }
 
 // ---------------------------------------------------------------------------
@@ -6721,6 +6884,13 @@ fn enrich_broker_positions(rows: &[Value], ltp_map: &HashMap<i64, f64>) -> Vec<V
 }
 
 fn snap_of(rt: &RealtimeState) -> Value {
+    // The per-second snapshot must stay small: shipping the whole closed ledger
+    // (thousands of rows, ~1MB) on a 1s poll starves slow/tunneled links and, with
+    // the client's out-of-order guard, freezes the whole pane. Send only the
+    // newest slice here plus the total count; the UI pulls the full ledger once
+    // from `/closed` whenever that count changes.
+    const CLOSED_SNAPSHOT_SLICE: usize = 100;
+
     // Resolve the real broker funds before taking the doc lock (it only touches
     // the funds cache). The paper wallet needs the doc snapshot and is derived
     // below while the lock is already held.
@@ -6744,7 +6914,8 @@ fn snap_of(rt: &RealtimeState) -> Value {
             v
         })
         .collect();
-    let closed: Vec<Value> = d.closed.iter().rev().cloned().collect();
+    let closed_total = d.closed.len();
+    let closed: Vec<Value> = d.closed.iter().rev().take(CLOSED_SNAPSHOT_SLICE).cloned().collect();
     let charges_on = rt.paper && d.settings.broker_charges;
     let smart = smart_stats(&d.closed, &positions, charges_on);
     let funds = rt.funds.lock().map(|f| f.clone()).unwrap_or(json!({}));
@@ -6752,19 +6923,19 @@ fn snap_of(rt: &RealtimeState) -> Value {
     let broker_positions = enrich_broker_positions(&broker_positions_raw, &ltp_map);
     let broker_holdings = rt.broker_holdings.lock().map(|h| h.clone()).unwrap_or_default();
     let movers = rt.movers_cache.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
-    let nifty_picks = rt.nifty_picks.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
     let picked_strikes = rt
         .picked_strikes
         .lock()
         .map(|g| g.1.clone())
         .unwrap_or_default();
     let final_list = final_scan(&d, &d.closed, charges_on);
-    // NIFTY ensemble trend readout for the engine header (dir: +1 bull / -1
-    // bear / 0 neutral), computed before `d.settings` is moved into the payload.
+    // NIFTY trend readout for the engine header. The trend-following engine
+    // logic was removed; these keys stay (dir always 0, picks empty) so the
+    // existing UI keeps rendering until the replacement function lands.
     let nifty_trend = json!({
         "on": d.settings.nifty_trend_on,
         "tf": d.settings.nifty_tf,
-        "dir": rt.nifty_dir.load(Ordering::Relaxed),
+        "dir": 0,
     });
     // Surface the timeframe the engine will actually run each strategy on (the
     // 1min/5min checkboxes + Multi-TF confirm override), so the Running
@@ -6871,7 +7042,8 @@ fn snap_of(rt: &RealtimeState) -> Value {
         "strategies": strategies_view,
         "positions": positions,
         "closed": closed,
-        "margin": rt.margin_info_from(d.settings.margin_pct, &d.positions, margin_available),
+        "closedCount": closed_total,
+        "margin": rt.margin_info_from(d.settings.margin_amount, d.settings.margin_pct, &d.positions, margin_available),
         "armed": d.armed,
         "engineOn": d.engine_on,
         "autoLots": d.auto_lots,
@@ -6888,7 +7060,7 @@ fn snap_of(rt: &RealtimeState) -> Value {
         "brokerPositions": broker_positions,
         "holdings": broker_holdings,
         "movers": movers,
-        "niftyPicks": nifty_picks,
+        "niftyPicks": [],
         "niftyTrend": nifty_trend,
         "autoSide": auto_side,
         "activeRunInSide": active_run_in_side,
@@ -6898,6 +7070,17 @@ fn snap_of(rt: &RealtimeState) -> Value {
 
 pub async fn snapshot(State(rt): State<RealtimeState>) -> impl IntoResponse {
     Json(snap_of(&rt))
+}
+
+/// Full closed-trade ledger (newest first), fetched on demand by the UI instead
+/// of riding along on every 1s snapshot.
+pub async fn closed_get(State(rt): State<RealtimeState>) -> impl IntoResponse {
+    let closed: Vec<Value> = rt
+        .doc()
+        .map(|d| d.closed.iter().rev().cloned().collect())
+        .unwrap_or_default();
+    let count = closed.len();
+    Json(json!({ "ok": true, "closed": closed, "count": count }))
 }
 
 pub async fn settings_post(State(rt): State<RealtimeState>, Json(v): Json<Value>) -> impl IntoResponse {
@@ -6916,12 +7099,10 @@ pub async fn settings_post(State(rt): State<RealtimeState>, Json(v): Json<Value>
             d.settings = s;
         }
         // Removing/restoring a scanner pick must take effect on the very next
-        // tick, not after the 15s (movers) / 60s (NIFTY) scan cache expires:
-        // reset the cadence clocks so the next pass rebuilds the universe.
+        // tick, not after the 15s movers scan cache expires: reset the cadence
+        // clock so the next pass rebuilds the universe.
         if d.settings.scanner_exclude != old_exclude {
             rt.last_movers.store(0, Ordering::Relaxed);
-            rt.last_nifty_scan.store(0, Ordering::Relaxed);
-            rt.last_trend.store(0, Ordering::Relaxed);
         }
         // Normalise a couple of engine fields the old UI also guarded: HFT
         // orders/sec never means "unset" (fall back to 6) and stays under the
@@ -7704,14 +7885,12 @@ pub async fn template_post(State(rt): State<RealtimeState>, Json(v): Json<Value>
 }
 
 pub async fn trend_get(State(rt): State<RealtimeState>) -> impl IntoResponse {
-    // On-demand scan so the NIFTY direction + picks fill independent of the
-    // engine run state.
-    rt.refresh_nifty_trend().await;
-    rt.refresh_nifty_scan().await;
+    // NIFTY trend-following engine removed. Keep the route returning an empty
+    // readout so the existing UI (which calls /trend on every refresh) stays
+    // functional until the replacement function lands.
     let on = rt.doc().map(|d| d.settings.nifty_trend_on).unwrap_or(false);
-    let readout = rt.nifty_readout().await;
-    let picks = readout.get("picks").cloned().unwrap_or(json!([]));
-    Json(json!({ "ok": true, "on": on, "dir": rt.nifty_dir.load(Ordering::Relaxed), "picks": picks, "detail": readout }))
+    let detail = json!({ "ok": true, "at": 0, "dir": 0, "picks": [] });
+    Json(json!({ "ok": true, "on": on, "dir": 0, "picks": [], "detail": detail }))
 }
 
 // ---------------------------------------------------------------------------
@@ -8024,6 +8203,7 @@ macro_rules! rt_routes {
     ($p:literal) => {
         Router::new()
             .route(concat!($p, "/snapshot"), get(snapshot))
+            .route(concat!($p, "/closed"), get(closed_get))
             .route(concat!($p, "/settings"), post(settings_post))
             .route(concat!($p, "/method"), post(method_post))
             .route(concat!($p, "/strategies"), get(strategies_get).post(strategies_post))
@@ -8156,6 +8336,42 @@ mod gate_tests {
     }
 
     #[test]
+    fn straight_line_consensus_gate_tracks_majority_vote() {
+        let candles = wave(400, 100.0, 0.05);
+        let dirs = algo_core::indicators::sl_consensus_dir(&candles, 2, 5, 5.0);
+        assert_eq!(dirs.len(), candles.len());
+        let mut flips = 0;
+        for off in 0..candles.len() {
+            let d = dirs[dirs.len() - 1 - off];
+            // Trend gate: bullish tolerates a rising/unknown line, bearish a
+            // falling/unknown one, so a fresh 0 is non-blocking on both sides.
+            assert_eq!(filter_eval("BullSlConsensus", &candles, off), Some(d >= 0));
+            assert_eq!(filter_eval("BearSlConsensus", &candles, off), Some(d <= 0));
+            if d != 0 {
+                flips += 1;
+            }
+        }
+        assert!(flips > 0, "consensus must resolve on an oscillating series");
+        // Arrow gate fires only on the bar the majority vote flips to the side.
+        let mut arrows = 0;
+        for off in 0..candles.len() {
+            if filter_eval("BullArrowConsensus", &candles, off) == Some(true) {
+                arrows += 1;
+            }
+        }
+        assert!(arrows > 0, "Arrow Consensus must fire at least once");
+    }
+
+    #[test]
+    fn straight_line_consensus_warmup_is_non_blocking() {
+        let candles = ramp(3, 100.0, 1.0);
+        // Too little history for the voters to resolve => unknown => pass.
+        assert_eq!(filter_eval("BullSlConsensus", &candles, 0), Some(true));
+        assert_eq!(filter_eval("BearSlConsensus", &candles, 0), Some(true));
+        assert_eq!(filter_eval("BullArrowConsensus", &candles, 0), Some(false));
+    }
+
+    #[test]
     fn straight_line_arrow_filters_use_pivot_trend() {
         // Constant-slope fits (auto trendline, pitchfork, projection, fans, S/R
         // EMA reversal) cannot flip on a per-bar slope change, so their arrow
@@ -8219,6 +8435,17 @@ mod gate_tests {
         assert_eq!(movers_auto_bias(true, true, 4, 4, 5, 5), 0);
         // Nothing selected -> neutral (manual side fallback).
         assert_eq!(movers_auto_bias(false, false, 0, 0, 9, 1), 0);
+    }
+
+    #[test]
+    fn option_strike_type_parses_resolved_legs() {
+        assert_eq!(option_strike_type("POLICYBZR-Sep2026-1900-PE"), Some((1900.0, "PE")));
+        assert_eq!(option_strike_type("CHOLAFIN-Sep2026-1800-PE"), Some((1800.0, "PE")));
+        assert_eq!(option_strike_type("NIFTY-Sep2026-24500-CE"), Some((24500.0, "CE")));
+        // Non-options and malformed legs must not be treated as option fills.
+        assert_eq!(option_strike_type("POLICYBZR"), None);
+        assert_eq!(option_strike_type("POLICYBZR-Sep2026-FUT"), None);
+        assert_eq!(option_strike_type(""), None);
     }
 
     #[test]
@@ -8368,7 +8595,7 @@ mod gate_tests {
     }
 
     #[test]
-    fn filter_mode_forces_strict_and_and_combines_with_brain_auto() {
+    fn filter_mode_uses_majority_and_combines_with_brain_auto() {
         let c = ramp(60, 100.0, 1.0);
         let mut s = Settings::default();
         // On a rising ramp two of the three ticked bull filters pass, one fails.
@@ -8376,18 +8603,23 @@ mod gate_tests {
         s.filters.insert("BullIncUpAll".into(), true);
         s.filters.insert("BullLtUp".into(), true);
         assert!(filter_gate(&s, &bull_strategy(), &c, 0), "non-filter majority clears");
-        // Indicator-filters mode is strict AND regardless of the all_in_one toggle.
+        // Indicator-filters mode no longer forces strict AND: a majority still
+        // clears the gate while the checkbox is off.
         s.filter_mode = true;
-        assert!(!filter_gate(&s, &bull_strategy(), &c, 0), "filter mode blocks when any filter fails");
-        // AI Brain AUTO is combined with (never softens) strict AND: a failed
-        // filter still blocks even though the score path alone would allow it.
+        assert!(filter_gate(&s, &bull_strategy(), &c, 0), "filter mode falls back to majority");
+        // AI Brain AUTO layers on top: a threshold the majority score cannot
+        // reach blocks the entry.
         s.brain_mode = "auto".into();
+        s.brain_threshold = 90;
+        assert!(!filter_gate(&s, &bull_strategy(), &c, 0), "brain threshold above majority score blocks");
+        // A threshold the majority score clears allows the entry.
         s.brain_threshold = 50;
-        assert!(!filter_gate(&s, &bull_strategy(), &c, 0), "brain AUTO cannot soften strict AND");
-        // Brain OFF but strict AND still on: one filter failing still blocks.
+        assert!(filter_gate(&s, &bull_strategy(), &c, 0), "brain threshold below majority score allows");
+        // The strict-AND checkbox alone re-imposes "every filter must pass".
         s.brain_mode = "off".into();
-        assert!(!filter_gate(&s, &bull_strategy(), &c, 0), "strict AND blocks without brain");
-        // Every ticked filter passing => allowed.
+        s.all_in_one = true;
+        assert!(!filter_gate(&s, &bull_strategy(), &c, 0), "strict AND blocks when any filter fails");
+        // Every ticked filter passing => allowed even under strict AND.
         s.filters.clear();
         s.filters.insert("BullIncUp".into(), true);
         assert!(filter_gate(&s, &bull_strategy(), &c, 0), "single passing filter allowed");
@@ -8466,15 +8698,21 @@ mod gate_tests {
     }
 
     #[test]
-    fn nifty_trend_votes_direction() {
-        let up = ramp(120, 100.0, 0.5);
-        let down = ramp(120, 200.0, -0.5);
-        let (ub, us) = nifty_trend_votes(&up, &[]);
-        let (db, ds) = nifty_trend_votes(&down, &[]);
-        assert!(ub > us, "rising series should be net bullish ({ub}/{us})");
-        assert!(ds > db, "falling series should be net bearish ({db}/{ds})");
-        let (ub2, us2) = nifty_trend_votes(&up, &["rsi".to_string(), "macd".to_string()]);
-        assert!(ub2 + us2 >= ub + us, "confirm indicators add votes");
+    fn scanner_sides_must_match_the_active_trade_side() {
+        // No committed side: each side runs on its own gating filters.
+        assert_eq!(side_allowed(true, true, None), (true, true));
+        // Committed to CE: only the bull side (which the CE leg follows) may run.
+        assert_eq!(side_allowed(true, true, Some("CE")), (true, false));
+        assert_eq!(side_allowed(true, true, Some("PE")), (false, true));
+        // Regression: only Bear filters armed but the engine is forced into CE
+        // (manual "Run Strategy In" with no auto direction). The bearish side
+        // cannot gate a CE entry, so nothing may run - previously the bearish
+        // strategy still built and fired an opposite CE order.
+        assert_eq!(side_allowed(false, true, Some("CE")), (false, false));
+        assert_eq!(side_allowed(true, false, Some("PE")), (false, false));
+        // An unarmed side can never be gated, even without a committed side.
+        assert_eq!(side_allowed(false, true, None), (false, true));
+        assert_eq!(side_allowed(true, false, None), (true, false));
     }
 
     const UI_BULL: &[&str] = &[
@@ -8657,9 +8895,9 @@ mod gate_tests {
             let raw: Vec<Option<bool>> = keys.iter().map(|k| filter_eval(k, &candles, 0)).collect();
             assert_eq!(scoped, shared, "memo changed a filter result");
             assert_eq!(shared, raw, "memo diverged from an unscoped pass");
-            // The filter_mode gate is a strict AND of the armed side filters.
+            // The strict-AND gate requires every armed side filter to pass.
             let mut st = enabled.clone();
-            st.filter_mode = true;
+            st.all_in_one = true;
             let gate = filter_gate(&st, &strat, &candles, 0);
             let bull_side = strategy_is_bull(&strat);
             let strict = enabled
@@ -8900,6 +9138,40 @@ mod gate_tests {
         for k in ["BearEma9_21", "BearSt10_1_2", "BearMeetCloseSt", "BearPbrAo"] {
             assert!(filter_eval(k, &down, 0).is_some(), "{k} should be implemented");
         }
+    }
+
+    #[test]
+    fn support_and_resistance_trend_filters_read_their_settings() {
+        let mut s = Settings::default();
+        s.sup_strength = 7.0;
+        s.sup_look = 20.0;
+        s.sup_full_span = true;
+        let sup = support_trend_cfg(&s);
+        assert_eq!(sup.strength, 7.0);
+        assert_eq!(sup.look, 20.0);
+        assert!(sup.full_span);
+        s.res_atr_period = 21.0;
+        s.res_min_pct = 0.2;
+        let res = resistance_trend_cfg(&s);
+        assert_eq!(res.atr_period, 21.0);
+        assert_eq!(res.min_pct, 0.2);
+        // The gate always resolves (non-blocking when the line is not drawn yet),
+        // so an unresolved fit can never freeze live entries.
+        let c = ramp(320, 100.0, 0.5);
+        assert!(filter_eval_inner("BullSlSupport", &c, 0, ConsensusCfg::default(), sup, res).is_some());
+        assert!(filter_eval_inner("BearSlResistance", &c, 0, ConsensusCfg::default(), sup, res).is_some());
+    }
+
+    #[test]
+    fn manual_margin_amount_overrides_percentage() {
+        // No manual amount: percentage of the available balance.
+        assert!((margin_budget_of(0.0, 50.0, 200_000.0) - 100_000.0).abs() < 1e-9);
+        assert!((margin_budget_of(0.0, 100.0, 200_000.0) - 200_000.0).abs() < 1e-9);
+        // Manual amount wins, capped by the live balance.
+        assert!((margin_budget_of(40_000.0, 100.0, 200_000.0) - 40_000.0).abs() < 1e-9);
+        assert!((margin_budget_of(500_000.0, 100.0, 200_000.0) - 200_000.0).abs() < 1e-9);
+        // Zero percentage with no amount stays disabled.
+        assert_eq!(margin_budget_of(0.0, 0.0, 200_000.0), 0.0);
     }
 
     // --- Engine controls: timeframe / MTF / auto-lots wiring -----------------

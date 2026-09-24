@@ -1445,10 +1445,12 @@ fn compute_iv(c: &[Candle], o: &Settings) -> Vec<SeriesOut> {
 
 fn compute_projline(c: &[Candle], o: &Settings) -> Vec<SeriesOut> {
     let lw = num(o, "lineWidth", 1.0);
-    let hist_color = strv(o, "histColor", "#7ee0ff");
+    let up = strv(o, "upColor", "#26a69a");
+    let dn = strv(o, "downColor", "#ef5350");
     let proj_color = strv(o, "projColor", "#b388ff");
+    let flat = strv(o, "histColor", "#7ee0ff");
     let empty = || vec![
-        SeriesOut::line("#000000", lw),
+        SeriesOut::line(&flat, lw),
         SeriesOut::line(&proj_color, lw),
     ];
     let cc = clean_candles(c);
@@ -1460,86 +1462,78 @@ fn compute_projline(c: &[Candle], o: &Settings) -> Vec<SeriesOut> {
     let atr_mult = if num(o, "atrMult", 2.0) > 0.0 { num(o, "atrMult", 2.0) } else { 2.0 };
     let min_pct = if num(o, "minPct", 0.15) >= 0.0 { num(o, "minPct", 0.15) } else { 0.15 };
     let fwd = (num(o, "fwd", 30.0).round() as i64).max(1);
-    let want_piv = (num(o, "pivots", 3.0).round() as i64).max(2) as usize;
-    let mode = strv(o, "mode", "trendline");
     let piv = atr_zigzag(&cc, atr_per, atr_mult, min_pct);
     if piv.len() < 2 {
         return empty();
     }
-    let used: Vec<ZigPivot> = if mode == "regression" {
-        let start = piv.len().saturating_sub(want_piv);
-        piv[start..].to_vec()
-    } else {
-        let highs: Vec<ZigPivot> = piv.iter().filter(|p| p.is_high).copied().collect();
-        let lows: Vec<ZigPivot> = piv.iter().filter(|p| !p.is_high).copied().collect();
-        let hh = if highs.len() >= 2 { Some(highs[highs.len() - 1].price > highs[highs.len() - 2].price) } else { None };
-        let hl = if lows.len() >= 2 { Some(lows[lows.len() - 1].price > lows[lows.len() - 2].price) } else { None };
-        let side = match (hh, hl) {
-            (Some(true), Some(true)) => "low",
-            (Some(false), Some(false)) => "high",
-            _ => if piv[piv.len() - 1].is_high { "high" } else { "low" },
-        };
-        let arr = if side == "high" { highs } else { lows };
-        let start = arr.len().saturating_sub(want_piv);
-        let mut u: Vec<ZigPivot> = arr[start..].to_vec();
-        if u.len() < 2 {
-            let start2 = piv.len().saturating_sub(want_piv);
-            u = piv[start2..].to_vec();
-        }
-        u
-    };
-    if used.len() < 2 {
-        return empty();
-    }
-    let m = used.len() as f64;
-    let mut sx = 0.0;
-    let mut sy = 0.0;
-    let mut sxx = 0.0;
-    let mut sxy = 0.0;
-    for p in &used {
+    // Segment-trend-wise zigzag history through the ATR swings, with a stable
+    // regression over the last few pivots projected forward into the future.
+    let k = piv.len().min(3);
+    let used = &piv[piv.len() - k..];
+    let mk = used.len() as f64;
+    let (mut sx, mut sy, mut sxx, mut sxy) = (0.0, 0.0, 0.0, 0.0);
+    for p in used {
         let x = p.idx as f64;
         sx += x;
         sy += p.price;
         sxx += x * x;
         sxy += x * p.price;
     }
-    let den = m * sxx - sx * sx;
-    let (a, b) = if den.abs() < 1e-9 {
+    let den = mk * sxx - sx * sx;
+    let (slope, b) = if den.abs() < 1e-9 {
         let p1 = used[0];
         let p2 = used[used.len() - 1];
         let di = (p2.idx as i64 - p1.idx as i64).max(1) as f64;
         let a = (p2.price - p1.price) / di;
         (a, p2.price - a * p2.idx as f64)
     } else {
-        let a = (m * sxy - sx * sy) / den;
-        (a, (sy - a * sx) / m)
+        let a = (mk * sxy - sx * sy) / den;
+        (a, (sy - a * sx) / mk)
     };
-    let val_at = |idx: f64| a * idx + b;
-    let start_idx = used[0].idx;
-    let mut hist = Vec::new();
-    for i in start_idx..n {
-        let v = val_at(i as f64);
-        if v.is_finite() {
-            hist.push(Point { time: cc[i].time, value: v, color: None });
+    let mut vts: Vec<usize> = piv.iter().map(|p| p.idx).collect();
+    let mut vals: Vec<f64> = piv.iter().map(|p| p.price).collect();
+    // Carry the zigzag to the live bar at the current price (so it never shoots
+    // away from the candles), then project the fitted slope forward from there.
+    let base = (cc[n - 1].high + cc[n - 1].low) * 0.5;
+    if *vts.last().unwrap() < n - 1 {
+        vts.push(n - 1);
+        vals.push(base);
+    }
+    let mut hist = pivot_zigzag_line(&cc, &vts, &vals, &up, &dn, &flat, lw);
+    let last_t = cc[n - 1].time;
+    // The carried right-edge point reflects the live trend so its colour matches
+    // the bar the trader is looking at, not the (possibly stale) last pivot leg.
+    let dir = live_trend_dir(&cc, num(o, "trendLen", 9.0).round().max(2.0) as usize);
+    if let Some(p) = hist.data.last_mut() {
+        if p.time == last_t {
+            p.color = Some(if dir.last().copied().unwrap_or(0) < 0 { dn.clone() } else { up.clone() });
         }
     }
-    let interval = if n >= 3 && cc[n - 1].time - cc[n - 2].time > 0 {
-        cc[n - 1].time - cc[n - 2].time
+    let interval = if n >= 3 && last_t - cc[n - 2].time > 0 {
+        last_t - cc[n - 2].time
     } else {
         60
     };
-    let last_t = cc[n - 1].time;
-    let mut fut = vec![Point { time: last_t, value: val_at((n - 1) as f64), color: None }];
-    for k in 1..=fwd {
-        let v = val_at((n - 1) as f64 + k as f64);
-        if v.is_finite() {
-            fut.push(Point { time: last_t + k * interval, value: v, color: None });
+    // Extend forward, but never draw the projection outside the price band: a
+    // steep last leg must not shoot off the chart and squeeze the candles.
+    let (plo, phi) = {
+        let lo = cc.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
+        let hi = cc.iter().map(|c| c.high).fold(f64::NEG_INFINITY, f64::max);
+        let pad = (hi - lo) * 0.25;
+        (lo - pad, hi + pad)
+    };
+    let mut fut: Vec<Point> = Vec::new();
+    if base.is_finite() && base >= plo && base <= phi {
+        fut.push(Point { time: last_t, value: base, color: Some(proj_color.clone()) });
+        for k in 1..=fwd {
+            let v = base + slope * k as f64;
+            if !v.is_finite() || v < plo || v > phi {
+                break;
+            }
+            fut.push(Point { time: last_t + k * interval, value: v, color: Some(proj_color.clone()) });
         }
     }
-    let dir = live_trend_dir(&cc, num(o, "trendLen", 9.0).round().max(2.0) as usize);
-    let mut s0 = mk_line(&hist_color, lw, hist, None);
-    color_points_by_dir(&cc, &mut s0.data, &dir, "#26a69a", "#ef5350");
-    vec![s0, mk_line(&proj_color, lw, fut, Some(2))]
+    vec![hist, mk_line(&proj_color, lw, fut, Some(2))]
 }
 
 fn compute_wavefib(c: &[Candle], o: &Settings) -> Vec<SeriesOut> {
@@ -1724,46 +1718,109 @@ fn compute_keylevel(c: &[Candle], o: &Settings) -> Vec<SeriesOut> {
 
 fn compute_autotrend(c: &[Candle], o: &Settings) -> Vec<SeriesOut> {
     let lw = num(o, "lineWidth", 2.0);
-    let empty = || vec![SeriesOut::line("#888888", lw)];
+    let up = strv(o, "upColor", "#26a69a");
+    let dn = strv(o, "downColor", "#ef5350");
+    let flat = "#888888";
     let cc = clean_candles(c);
-    if cc.len() < 12 {
-        return empty();
+    let n = cc.len();
+    if n < 12 {
+        return vec![SeriesOut::line(flat, lw)];
+    }
+    // Segment-trend-wise zigzag through the swing pivots the auto trendline is
+    // anchored to, instead of a single constant-slope best-fit line.
+    let piv = fractal_pivots(&cc, num(o, "strength", 5.0));
+    let alt = alternating_pivots(&piv);
+    if alt.len() < 2 {
+        return vec![SeriesOut::line(flat, lw)];
+    }
+    let mut vts: Vec<usize> = alt.iter().map(|p| p.idx).collect();
+    let mut vals: Vec<f64> = alt.iter().map(|p| p.price).collect();
+    // Reach the live bar so the zigzag tracks the trend to the right edge.
+    if *vts.last().unwrap() < n - 1 {
+        vts.push(n - 1);
+        vals.push((cc[n - 1].high + cc[n - 1].low) * 0.5);
+    }
+    vec![pivot_zigzag_line(&cc, &vts, &vals, &up, &dn, flat, lw)]
+}
+
+fn compute_level_trend(c: &[Candle], o: &Settings, support: bool) -> Vec<SeriesOut> {
+    let lw = num(o, "lineWidth", 2.0);
+    let up = strv(o, "upColor", "#26a69a");
+    let dn = strv(o, "downColor", "#ef5350");
+    let cc = clean_candles(c);
+    let n = cc.len();
+    if n < 12 {
+        return vec![SeriesOut::line(&up, lw)];
     }
     let piv = fractal_pivots(&cc, num(o, "strength", 5.0));
-    if piv.len() < 3 {
-        return empty();
+    let side: Vec<Pivot> = piv.iter().filter(|p| p.is_high != support).copied().collect();
+    if side.len() < 2 {
+        return vec![SeriesOut::line(&up, lw)];
     }
     let atr_per = (num(o, "atrPeriod", 14.0).round() as i64).max(2);
     let atr = wilder_arr(&tr_arr(&cc), atr_per);
     let atr_last = last_finite(&atr);
-    let last_close = cc[cc.len() - 1].close;
+    let last_close = cc[n - 1].close;
     let min_pct = if num(o, "minPct", 0.05) >= 0.0 { num(o, "minPct", 0.05) } else { 0.05 };
-    let mut tol = (atr_last * if num(o, "tolMult", 0.5) > 0.0 { num(o, "tolMult", 0.5) } else { 0.5 })
+    let mut tol = (atr_last * num(o, "tolMult", 0.5).max(0.0))
         .max(last_close.abs() * (min_pct / 100.0));
     if !(tol > 0.0) {
         tol = if last_close.abs() * 0.001 != 0.0 { last_close.abs() * 0.001 } else { 1.0 };
     }
-    let best = match auto_trend_line(&cc, &piv, num(o, "look", 60.0), tol) {
+    let best = match side_trend_line(&cc, &side, num(o, "look", 12.0), tol, support) {
         Some(b) => b,
-        None => return empty(),
+        None => return vec![SeriesOut::line(&up, lw)],
     };
-    let col = if best.is_support {
-        strv(o, "upColor", "#26a69a")
+    // Rising line green, falling line red, so the colour tracks the slope the
+    // trader sees rather than the support/resistance label.
+    let col = if best.a >= 0.0 { up } else { dn };
+    let last_t = cc[n - 1].time;
+    let interval = if n >= 2 && last_t - cc[n - 2].time > 0 {
+        last_t - cc[n - 2].time
     } else {
-        strv(o, "downColor", "#ef5350")
+        60
     };
-    let start = if boolv(o, "fullSpan", true) { 0 } else { best.p1_idx };
-    let mut data = Vec::new();
-    for i in start..cc.len() {
+    let (plo, phi) = {
+        let lo = cc.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
+        let hi = cc.iter().map(|c| c.high).fold(f64::NEG_INFINITY, f64::max);
+        let pad = (hi - lo) * 0.25;
+        (lo - pad, hi + pad)
+    };
+    let fwd = (num(o, "fwd", 10.0).round() as i64).max(0);
+    let start = if boolv(o, "fullSpan", false) { 0 } else { best.p1_idx };
+    let mut data: Vec<Point> = Vec::new();
+    for i in start..n {
         let v = best.a * i as f64 + best.b;
         if v.is_finite() {
             data.push(Point { time: cc[i].time, value: v, color: None });
         }
     }
-    let dir = live_trend_dir(&cc, num(o, "trendLen", 9.0).round().max(2.0) as usize);
-    let mut s = mk_line(&col, lw, data, None);
-    color_points_by_dir(&cc, &mut s.data, &dir, &strv(o, "upColor", "#26a69a"), &strv(o, "downColor", "#ef5350"));
-    vec![s]
+    // Extend forward, but never draw the projection outside the price band:
+    // a steep fit must not shoot off the top/bottom of the chart.
+    for k in 1..=fwd {
+        let v = best.a * (n as f64 - 1.0 + k as f64) + best.b;
+        if !v.is_finite() || v < plo || v > phi {
+            break;
+        }
+        data.push(Point { time: last_t + k * interval, value: v, color: None });
+    }
+    vec![mk_line(&col, lw, data, None)]
+}
+
+fn compute_supline(c: &[Candle], o: &Settings) -> Vec<SeriesOut> {
+    compute_level_trend(c, o, true)
+}
+
+fn compute_resline(c: &[Candle], o: &Settings) -> Vec<SeriesOut> {
+    compute_level_trend(c, o, false)
+}
+
+fn markers_supline(c: &[Candle], o: &Settings) -> Vec<Marker> {
+    markers_pivot_trend(c, o, &strv(o, "upColor", "#26a69a"), &strv(o, "downColor", "#ef5350"))
+}
+
+fn markers_resline(c: &[Candle], o: &Settings) -> Vec<Marker> {
+    markers_pivot_trend(c, o, &strv(o, "upColor", "#26a69a"), &strv(o, "downColor", "#ef5350"))
 }
 
 fn compute_smiio(c: &[Candle], o: &Settings) -> Vec<SeriesOut> {
@@ -2400,20 +2457,27 @@ fn compute_panemaster(c: &[Candle], o: &Settings) -> Vec<SeriesOut> {
     let lw = num(o, "lineWidth", 2.0);
     let up = strv(o, "upColor", "#26a69a");
     let dn = strv(o, "downColor", "#ef5350");
-    let trend = strv(o, "trendColor", "#2962ff");
+    let flat = strv(o, "trendColor", "#2962ff");
     let sig = pane_signal(c, o);
-    if sig.cc.is_empty() {
-        return vec![SeriesOut::line(&trend, lw), SeriesOut::line(&trend, lw)];
+    if sig.cc.len() < 35 {
+        return vec![SeriesOut::line(&flat, lw)];
     }
-    let fit_color = if sig.cur_reg > 0 { up.clone() } else { dn.clone() };
-    let dir = live_trend_dir(&sig.cc, num(o, "trendLen", 9.0).round().max(2.0) as usize);
-    let mut s0 = mk_line(&up, lw, sig.data.clone(), None);
-    color_points_by_dir(&sig.cc, &mut s0.data, &dir, &up, &dn);
-    let mut fit = mk_line(&fit_color, lw, sig.fit_data.clone(), Some(2));
-    color_points_by_dir(&sig.cc, &mut fit.data, &dir, &up, &dn);
-    fit.last_value_visible = false;
-    fit.price_line_visible = false;
-    vec![s0, fit]
+    // Segment-trend-wise zigzag over the fused pane score: turn at every real
+    // swing instead of drawing one least-squares line across a whole regime
+    // (which cut through opposite trends). The six oscillators must move with
+    // the leg for a turn to be kept.
+    let strength = num(o, "minSeg", 3.0).round().max(1.0) as usize;
+    let matrix: Vec<Vec<Option<f64>>> = vec![
+        sig.rsi.clone(),
+        sig.bb_pct.clone(),
+        sig.st_k.clone(),
+        sig.cci.clone(),
+        sig.will_r.clone(),
+        sig.mfi.clone(),
+    ];
+    let mid = price_mid_series(&sig.cc);
+    let vts = zigzag_vertices(&mid, &matrix, strength, strength, 2);
+    vec![zigzag_series_line(&sig.cc, &vts, &up, &dn, &flat, lw)]
 }
 
 fn markers_panemaster(c: &[Candle], o: &Settings) -> Vec<Marker> {
@@ -2481,6 +2545,739 @@ fn markers_panemaster(c: &[Candle], o: &Settings) -> Vec<Marker> {
             prev_ob = ob_now;
             prev_os = os_now;
         }
+    }
+    mk
+}
+
+// ---------------------------------------------------------------------------
+// Straight Line Consensus
+// ---------------------------------------------------------------------------
+
+/// Per-bar direction (+1 rising / -1 falling / 0 no resolved line yet) of one
+/// output series (`idx`) of a straight-line indicator (`id`), aligned to `c`.
+fn sl_line_dir(c: &[Candle], id: &str, idx: usize) -> Vec<i32> {
+    let o: Settings = Settings::new();
+    let outs = match id {
+        "ewtrend" => compute_ewtrend(c, &o),
+        "patrend" => compute_patrend(c, &o),
+        "zzline" => compute_zzline(c, &o),
+        "trendmaster" => compute_trendmaster(c, &o),
+        "panemaster" => compute_panemaster(c, &o),
+        "autotrend" => compute_autotrend(c, &o),
+        "pitchfork" => compute_pitchfork(c, &o),
+        "projline" => compute_projline(c, &o),
+        "gant" => compute_gant(c, &o),
+        "fibt" => compute_fibt(c, &o),
+        "sremat" => compute_sremat(c, &o),
+        _ => return vec![0; c.len()],
+    };
+    let mut by_time: BTreeMap<i64, f64> = BTreeMap::new();
+    if let Some(s) = outs.get(idx) {
+        for p in &s.data {
+            if p.value.is_finite() {
+                by_time.insert(p.time, p.value);
+            }
+        }
+    }
+    let vals: Vec<Option<f64>> = c.iter().map(|x| by_time.get(&x.time).copied()).collect();
+    let mut out = vec![0i32; c.len()];
+    let mut last = 0i32;
+    for i in 0..vals.len() {
+        if let Some(v) = vals[i] {
+            if i > 0 {
+                if let Some(pv) = vals[i - 1] {
+                    if v > pv {
+                        last = 1;
+                    } else if v < pv {
+                        last = -1;
+                    }
+                }
+            }
+        }
+        out[i] = last;
+    }
+    out
+}
+
+/// Direction of the "Straight Line Consensus" trendline.
+///
+/// The twelve straight-line indicators vote a direction, but a raw vote is
+/// leading and flips well before the candles turn. To make the line follow the
+/// market like the support/resistance trendline (and flip only on a real
+/// reversal) the consensus direction is locked to the swing structure:
+/// a new direction must clear `min_agree` votes for `confirm` bars and then
+/// price must actually break structure (close beyond the most recent confirmed
+/// swing high for a bull flip, below the most recent confirmed swing low for a
+/// bear flip). Until structure breaks the old trend is carried forward, so the
+/// line stays with the candles right up to the reversal.
+pub fn sl_consensus_dir(c: &[Candle], min_agree: i32, confirm: usize, strength: f64) -> Vec<i32> {
+    let n = c.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let need = min_agree.max(1);
+    let voters: [(&str, usize); 12] = [
+        ("ewtrend", 0),
+        ("ewtrend", 0),
+        ("patrend", 0),
+        ("zzline", 1),
+        ("trendmaster", 1),
+        ("panemaster", 0),
+        ("autotrend", 0),
+        ("pitchfork", 0),
+        ("projline", 0),
+        ("gant", 0),
+        ("fibt", 0),
+        ("sremat", 0),
+    ];
+    let mut votes = vec![0i32; n];
+    for (id, idx) in voters {
+        let d = sl_line_dir(c, id, idx);
+        for i in 0..n {
+            votes[i] += d.get(i).copied().unwrap_or(0);
+        }
+    }
+    consensus_gate(c, &votes, need, confirm, strength)
+}
+
+/// Per-bar direction (+1 rising / -1 falling) of the aggregate line of one
+/// overlay indicator (`id`): the mean of all of its finite output series at each
+/// bar (for bands/channels that is the channel mid; for single-line indicators
+/// it is the line itself). Used as one vote by the overlay consensus.
+fn ovl_line_dir(c: &[Candle], id: &str) -> Vec<i32> {
+    let o: Settings = Settings::new();
+    let outs = match id {
+        "ema" => compute_ema(c, &o),
+        "ma" => compute_ma(c, &o),
+        "smma" => compute_smma(c, &o),
+        "hma" => compute_hma(c, &o),
+        "bb" => compute_bb(c, &o),
+        "keltner" => compute_keltner(c, &o),
+        "pc" => compute_pc(c, &o),
+        "donchian" => compute_donchian(c, &o),
+        "chandelier" => compute_chandelier(c, &o),
+        "ichimoku" => compute_ichimoku(c, &o),
+        "supertrend" => compute_supertrend(c, &o),
+        "vwap" => compute_vwap(c, &o),
+        _ => return vec![0; c.len()],
+    };
+    let n = c.len();
+    let mut sum = vec![0.0f64; n];
+    let mut cnt = vec![0u32; n];
+    let mut by_time: BTreeMap<i64, usize> = BTreeMap::new();
+    for (i, x) in c.iter().enumerate() {
+        by_time.insert(x.time, i);
+    }
+    for s in &outs {
+        for p in &s.data {
+            if p.value.is_finite() {
+                if let Some(&i) = by_time.get(&p.time) {
+                    sum[i] += p.value;
+                    cnt[i] += 1;
+                }
+            }
+        }
+    }
+    let mut out = vec![0i32; n];
+    let mut last = 0i32;
+    let mut prev: Option<f64> = None;
+    for i in 0..n {
+        if cnt[i] > 0 {
+            let v = sum[i] / cnt[i] as f64;
+            if let Some(pv) = prev {
+                if v > pv {
+                    last = 1;
+                } else if v < pv {
+                    last = -1;
+                }
+            }
+            prev = Some(v);
+        }
+        out[i] = last;
+    }
+    out
+}
+
+/// Direction of the "Overlay Consensus" trendline. The twelve classic overlay
+/// indicators (EMA, MA, SMMA, HMA, Bollinger, Keltner, Price Channel, Donchian,
+/// Chandelier, Ichimoku, Supertrend, VWAP) each vote their own slope; the
+/// majority is gated exactly like the straight-line consensus, so the fused line
+/// flips only on a real, price-confirmed reversal.
+pub fn ovl_consensus_dir(c: &[Candle], min_agree: i32, confirm: usize, strength: f64) -> Vec<i32> {
+    let n = c.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let voters = [
+        "ema",
+        "ma",
+        "smma",
+        "hma",
+        "bb",
+        "keltner",
+        "pc",
+        "donchian",
+        "chandelier",
+        "ichimoku",
+        "supertrend",
+        "vwap",
+    ];
+    let mut votes = vec![0i32; n];
+    for id in voters {
+        let d = ovl_line_dir(c, id);
+        for i in 0..n {
+            votes[i] += d.get(i).copied().unwrap_or(0);
+        }
+    }
+    consensus_gate(c, &votes, min_agree, confirm, strength)
+}
+
+/// Apply the vote-threshold + confirmation + swing-structure gate to a raw
+/// per-bar vote tally. Shared by every consensus indicator (straight-line and
+/// overlay) so they all flip only on a real, price-confirmed reversal.
+fn consensus_gate(
+    c: &[Candle],
+    votes: &[i32],
+    min_agree: i32,
+    confirm: usize,
+    strength: f64,
+) -> Vec<i32> {
+    let n = c.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let need = min_agree.max(1);
+    // Most recent *confirmed* swing high/low available at each bar (a fractal
+    // pivot is only known `strength` bars after it printed, so it is causal).
+    // `strength < 2` disables structural gating entirely: the consensus then
+    // follows the raw vote (used by the engine indicator-filter, whose settings
+    // default to 0 = flip the instant the vote flips).
+    let use_structure = strength >= 2.0;
+    let piv = if use_structure { fractal_pivots(c, strength) } else { Vec::new() };
+    let mut ph: Vec<Option<f64>> = vec![None; n];
+    let mut pl: Vec<Option<f64>> = vec![None; n];
+    let mut last_ph: Option<f64> = None;
+    let mut last_pl: Option<f64> = None;
+    let mut pi = 0usize;
+    for i in 0..n {
+        while pi < piv.len() && piv[pi].at <= i {
+            if piv[pi].is_high {
+                last_ph = Some(piv[pi].price);
+            } else {
+                last_pl = Some(piv[pi].price);
+            }
+            pi += 1;
+        }
+        ph[i] = last_ph;
+        pl[i] = last_pl;
+    }
+    let mut out = vec![0i32; n];
+    let mut cur = 0i32;
+    let mut pending = 0i32;
+    let mut streak = 0usize;
+    for i in 0..n {
+        let desired = if votes[i] >= need {
+            1
+        } else if votes[i] <= -need {
+            -1
+        } else {
+            0
+        };
+        if desired == 0 || desired == cur {
+            streak = 0;
+            pending = 0;
+        } else if desired == pending {
+            streak += 1;
+        } else {
+            pending = desired;
+            streak = 1;
+        }
+        if pending != 0 && streak >= confirm.max(1) {
+            // Structure break required to flip (the very first resolution is
+            // allowed from votes alone so the line can start). With structural
+            // gating disabled the vote flips immediately.
+            let price_ok = if !use_structure || cur == 0 {
+                true
+            } else if pending > 0 {
+                ph[i].map_or(false, |h| c[i].close > h)
+            } else {
+                pl[i].map_or(false, |l| c[i].close < l)
+            };
+            if price_ok {
+                cur = pending;
+                streak = 0;
+                pending = 0;
+            }
+        }
+        out[i] = cur;
+    }
+    out
+}
+
+/// Candle midpoints as a value series: the price axis the consensus zigzags are
+/// anchored to, so their legs always cut through the candle bodies and every
+/// real price swing is a zigzag candidate.
+fn price_mid_series(cc: &[Candle]) -> Vec<Option<f64>> {
+    cc.iter().map(|c| Some((c.high + c.low) * 0.5)).collect()
+}
+
+/// Align the twelve straight-line indicators (one chosen output series each,
+/// same voters as `sl_consensus_dir`) and return their per-bar mean. Used as the
+/// value axis of the zigzag drawn by the Straight Line Consensus.
+fn sl_series_matrix(c: &[Candle]) -> (Vec<Option<f64>>, Vec<Vec<Option<f64>>>) {
+    let o: Settings = Settings::new();
+    let voters: [(&str, usize); 12] = [
+        ("ewtrend", 0),
+        ("ewtrend", 0),
+        ("patrend", 0),
+        ("zzline", 1),
+        ("trendmaster", 1),
+        ("panemaster", 0),
+        ("autotrend", 0),
+        ("pitchfork", 0),
+        ("projline", 0),
+        ("gant", 0),
+        ("fibt", 0),
+        ("sremat", 0),
+    ];
+    let n = c.len();
+    let mut by_time: BTreeMap<i64, usize> = BTreeMap::new();
+    for (i, x) in c.iter().enumerate() {
+        by_time.insert(x.time, i);
+    }
+    let mut matrix: Vec<Vec<Option<f64>>> = Vec::with_capacity(voters.len());
+    let mut sum = vec![0.0f64; n];
+    let mut cnt = vec![0u32; n];
+    for (id, idx) in voters {
+        let outs = match id {
+            "ewtrend" => compute_ewtrend(c, &o),
+            "patrend" => compute_patrend(c, &o),
+            "zzline" => compute_zzline(c, &o),
+            "trendmaster" => compute_trendmaster(c, &o),
+            "panemaster" => compute_panemaster(c, &o),
+            "autotrend" => compute_autotrend(c, &o),
+            "pitchfork" => compute_pitchfork(c, &o),
+            "projline" => compute_projline(c, &o),
+            "gant" => compute_gant(c, &o),
+            "fibt" => compute_fibt(c, &o),
+            "sremat" => compute_sremat(c, &o),
+            _ => Vec::new(),
+        };
+        let mut col = vec![None; n];
+        if let Some(s) = outs.get(idx) {
+            for p in &s.data {
+                if p.value.is_finite() {
+                    if let Some(&i) = by_time.get(&p.time) {
+                        if col[i].is_none() {
+                            col[i] = Some(p.value);
+                        }
+                    }
+                }
+            }
+        }
+        for i in 0..n {
+            if let Some(v) = col[i] {
+                sum[i] += v;
+                cnt[i] += 1;
+            }
+        }
+        matrix.push(col);
+    }
+    let agg = (0..n)
+        .map(|i| if cnt[i] > 0 { Some(sum[i] / cnt[i] as f64) } else { None })
+        .collect();
+    (agg, matrix)
+}
+
+fn compute_slconsensus(c: &[Candle], o: &Settings) -> Vec<SeriesOut> {
+    let lw = num(o, "lineWidth", 2.0);
+    let up = strv(o, "upColor", "#00e676");
+    let dn = strv(o, "downColor", "#ff5252");
+    let flat = strv(o, "flatColor", "#6b6b88");
+    let need = num(o, "minAgree", 2.0).round().max(1.0) as usize;
+    let confirm = num(o, "confirm", 5.0).round().max(0.0) as usize;
+    let strength = num(o, "strength", 5.0).round().max(2.0);
+    let cc = clean_candles(c);
+    if cc.len() < 2 {
+        return vec![SeriesOut::line(&flat, lw)];
+    }
+    // Segment-trend-wise zigzag over the twelve straight-line indicators'
+    // aggregate: one straight leg per swing, turning at every real reversal
+    // instead of a single long line that would cut across other trends.
+    let (_, matrix) = sl_series_matrix(&cc);
+    let mid = price_mid_series(&cc);
+    let vts = zigzag_vertices(&mid, &matrix, strength as usize, confirm, need);
+    vec![zigzag_series_line(&cc, &vts, &up, &dn, &flat, lw)]
+}
+
+fn markers_slconsensus(c: &[Candle], o: &Settings) -> Vec<Marker> {
+    let up = strv(o, "upColor", "#00e676");
+    let dn = strv(o, "downColor", "#ff5252");
+    let need = num(o, "minAgree", 2.0).round().max(1.0) as usize;
+    let confirm = num(o, "confirm", 5.0).round().max(0.0) as usize;
+    let strength = num(o, "strength", 5.0).round().max(2.0);
+    let cc = clean_candles(c);
+    if cc.len() < 2 {
+        return Vec::new();
+    }
+    let (_, matrix) = sl_series_matrix(&cc);
+    let mid = price_mid_series(&cc);
+    let vts = zigzag_vertices(&mid, &matrix, strength as usize, confirm, need);
+    zigzag_turn_markers(&cc, &vts, &up, &dn)
+}
+
+/// Align the twelve overlay indicators to the candles as one column each and
+/// return their per-bar mean (`agg`). For bands/channels the mean of all output
+/// lines is the channel mid; for single-line indicators it is the line itself.
+fn ovl_series_matrix(c: &[Candle]) -> (Vec<Option<f64>>, Vec<Vec<Option<f64>>>) {
+    let o: Settings = Settings::new();
+    let ids = [
+        "ema", "ma", "smma", "hma", "bb", "keltner", "pc", "donchian", "chandelier",
+        "ichimoku", "supertrend", "vwap",
+    ];
+    let n = c.len();
+    let mut by_time: BTreeMap<i64, usize> = BTreeMap::new();
+    for (i, x) in c.iter().enumerate() {
+        by_time.insert(x.time, i);
+    }
+    let mut matrix: Vec<Vec<Option<f64>>> = Vec::with_capacity(ids.len());
+    let mut sum = vec![0.0f64; n];
+    let mut cnt = vec![0u32; n];
+    for id in ids {
+        let outs = match id {
+            "ema" => compute_ema(c, &o),
+            "ma" => compute_ma(c, &o),
+            "smma" => compute_smma(c, &o),
+            "hma" => compute_hma(c, &o),
+            "bb" => compute_bb(c, &o),
+            "keltner" => compute_keltner(c, &o),
+            "pc" => compute_pc(c, &o),
+            "donchian" => compute_donchian(c, &o),
+            "chandelier" => compute_chandelier(c, &o),
+            "ichimoku" => compute_ichimoku(c, &o),
+            "supertrend" => compute_supertrend(c, &o),
+            "vwap" => compute_vwap(c, &o),
+            _ => Vec::new(),
+        };
+        let mut col = vec![None; n];
+        for s in &outs {
+            for p in &s.data {
+                if p.value.is_finite() {
+                    if let Some(&i) = by_time.get(&p.time) {
+                        if col[i].is_none() {
+                            col[i] = Some(p.value);
+                        }
+                    }
+                }
+            }
+        }
+        for i in 0..n {
+            if let Some(v) = col[i] {
+                sum[i] += v;
+                cnt[i] += 1;
+            }
+        }
+        matrix.push(col);
+    }
+    let agg = (0..n)
+        .map(|i| if cnt[i] > 0 { Some(sum[i] / cnt[i] as f64) } else { None })
+        .collect();
+    (agg, matrix)
+}
+
+fn first_valid_idx(v: &[Option<f64>]) -> Option<usize> {
+    v.iter().position(|x| x.is_some())
+}
+
+fn last_valid_idx(v: &[Option<f64>]) -> Option<usize> {
+    v.iter().rposition(|x| x.is_some())
+}
+
+/// ZigZag turning points of the aggregate overlay line: alternate swing
+/// highs/lows with at least `half` bars on each side, legs at least `min_leg`
+/// bars long, and each leg backed by at least `min_agree` of the twelve overlay
+/// indicators moving the same way. Endpoints are always included so the line
+/// spans the whole series.
+fn zigzag_vertices(
+    agg: &[Option<f64>],
+    matrix: &[Vec<Option<f64>>],
+    half: usize,
+    min_leg: usize,
+    min_agree: usize,
+) -> Vec<usize> {
+    let n = agg.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let half = half.max(1);
+    let min_leg = min_leg.max(1);
+    let mut cand: Vec<(usize, bool)> = Vec::new();
+    for i in 0..n {
+        let v = match agg[i] {
+            Some(v) => v,
+            None => continue,
+        };
+        let lo = i.saturating_sub(half);
+        let hi = (i + half).min(n - 1);
+        let mut is_high = true;
+        let mut is_low = true;
+        for (j, x) in agg.iter().enumerate().take(hi + 1).skip(lo) {
+            if j == i {
+                continue;
+            }
+            if let Some(vj) = *x {
+                if vj > v {
+                    is_high = false;
+                }
+                if vj < v {
+                    is_low = false;
+                }
+            }
+        }
+        if is_high {
+            cand.push((i, true));
+        } else if is_low {
+            cand.push((i, false));
+        }
+    }
+    let mut vts: Vec<usize> = Vec::new();
+    let mut highs: Vec<bool> = Vec::new();
+    for (i, is_high) in cand {
+        let v = agg[i].unwrap();
+        if vts.is_empty() {
+            vts.push(i);
+            highs.push(is_high);
+            continue;
+        }
+        let last = *vts.last().unwrap();
+        let last_high = *highs.last().unwrap();
+        if i.saturating_sub(last) < min_leg {
+            continue;
+        }
+        if is_high == last_high {
+            let lv = agg[last].unwrap();
+            let better = if is_high { v > lv } else { v < lv };
+            if better {
+                *vts.last_mut().unwrap() = i;
+            }
+            continue;
+        }
+        // A low -> high leg is an up move (and high -> low a down move). Keep
+        // the turn only when enough of the twelve overlays agree with the leg.
+        let go_up = !last_high;
+        let mut oks = 0usize;
+        for col in matrix {
+            if let (Some(va), Some(vb)) = (col[last], col[i]) {
+                if (go_up && vb > va) || (!go_up && vb < va) {
+                    oks += 1;
+                }
+            }
+        }
+        if oks < min_agree {
+            continue;
+        }
+        vts.push(i);
+        highs.push(is_high);
+    }
+    if vts.is_empty() {
+        if let (Some(f), Some(l)) = (first_valid_idx(agg), last_valid_idx(agg)) {
+            vts.push(f);
+            if l != f {
+                vts.push(l);
+            }
+        }
+        return vts;
+    }
+    if let Some(f) = first_valid_idx(agg) {
+        if f < vts[0] {
+            vts.insert(0, f);
+        }
+    }
+    if let Some(l) = last_valid_idx(agg) {
+        if l > *vts.last().unwrap() {
+            vts.push(l);
+        }
+    }
+    vts
+}
+
+/// Build the zigzag line from a set of vertex indices: one straight leg between
+/// consecutive vertices. Values are anchored to the candle midpoint so the line
+/// always cuts through the candle bodies rather than floating on an averaged
+/// indicator scale; each leg is coloured by its own visible slope.
+fn zigzag_series_line(
+    cc: &[Candle],
+    vts: &[usize],
+    up: &str,
+    dn: &str,
+    flat: &str,
+    lw: f64,
+) -> SeriesOut {
+    let mid = |i: usize| (cc[i].high + cc[i].low) * 0.5;
+    let mut data: Vec<Point> = Vec::new();
+    for (k, &i) in vts.iter().enumerate() {
+        let v = mid(i);
+        let color = if k == 0 {
+            flat.to_string()
+        } else {
+            let pv = mid(vts[k - 1]);
+            if v > pv {
+                up.to_string()
+            } else if v < pv {
+                dn.to_string()
+            } else {
+                flat.to_string()
+            }
+        };
+        data.push(Point { time: cc[i].time, value: (v * 100.0).round() / 100.0, color: Some(color) });
+    }
+    mk_line(flat, lw, data, None)
+}
+
+/// Flip arrows at the internal zigzag turns: a low turn is a bull start, a high
+/// turn a bear start.
+fn zigzag_turn_markers(cc: &[Candle], vts: &[usize], up: &str, dn: &str) -> Vec<Marker> {
+    let mid = |i: usize| (cc[i].high + cc[i].low) * 0.5;
+    let mut mk: Vec<Marker> = Vec::new();
+    for k in 1..vts.len().saturating_sub(1) {
+        let cur = mid(vts[k]);
+        let prev = mid(vts[k - 1]);
+        let next = mid(vts[k + 1]);
+        let is_high = cur >= prev && cur >= next;
+        let bull = !is_high;
+        mk.push(Marker {
+            time: cc[vts[k]].time,
+            position: if bull { "belowBar" } else { "aboveBar" }.into(),
+            color: if bull { up.to_string() } else { dn.to_string() },
+            shape: if bull { "arrowUp" } else { "arrowDown" }.into(),
+            text: if bull { "BULL" } else { "BEAR" }.into(),
+            size: 1.0,
+        });
+    }
+    mk
+}
+
+/// Collapse a pivot list to strict high/low alternation: when two consecutive
+/// pivots are on the same side keep only the more extreme one.
+fn alternating_pivots(piv: &[Pivot]) -> Vec<Pivot> {
+    let mut out: Vec<Pivot> = Vec::new();
+    for p in piv {
+        match out.last_mut() {
+            None => out.push(*p),
+            Some(last) => {
+                if last.is_high == p.is_high {
+                    let better = if p.is_high { p.price > last.price } else { p.price < last.price };
+                    if better {
+                        *last = *p;
+                    }
+                } else if p.idx > last.idx {
+                    out.push(*p);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Segment-trend-wise zigzag through confirmed swing pivots: one straight leg
+/// between consecutive pivots, each coloured by that leg's direction. Used by
+/// the Auto Trendline and Trend Projection so they follow the price swings
+/// instead of one constant-slope fit.
+fn pivot_zigzag_line(
+    cc: &[Candle],
+    vts: &[usize],
+    vals: &[f64],
+    up: &str,
+    dn: &str,
+    flat: &str,
+    lw: f64,
+) -> SeriesOut {
+    let m = vts.len().min(vals.len());
+    let mut data: Vec<Point> = Vec::with_capacity(m);
+    for k in 0..m {
+        let v = vals[k];
+        if !v.is_finite() || vts[k] >= cc.len() {
+            continue;
+        }
+        let color = if k + 1 < m {
+            if vals[k + 1] >= v { up } else { dn }
+        } else if k > 0 {
+            if v >= vals[k - 1] { up } else { dn }
+        } else {
+            flat
+        };
+        data.push(Point { time: cc[vts[k]].time, value: v, color: Some(color.into()) });
+    }
+    mk_line(flat, lw, data, None)
+}
+
+fn compute_ovlconsensus(c: &[Candle], o: &Settings) -> Vec<SeriesOut> {
+    let lw = num(o, "lineWidth", 2.0);
+    let up = strv(o, "upColor", "#00e676");
+    let dn = strv(o, "downColor", "#ff5252");
+    let flat = strv(o, "flatColor", "#6b6b88");
+    let need = num(o, "minAgree", 2.0).round().max(1.0) as usize;
+    let confirm = num(o, "confirm", 5.0).round().max(0.0) as usize;
+    let strength = num(o, "strength", 5.0).round().max(2.0);
+    let cc = clean_candles(c);
+    if cc.len() < 2 {
+        return vec![SeriesOut::line(&flat, lw)];
+    }
+    // Segment-trend-wise zigzag: draw a straight leg between every aggregate
+    // swing turn instead of one long line across a whole consensus regime, so
+    // the line never cuts through an opposite trend on its way.
+    let (agg, matrix) = ovl_series_matrix(&cc);
+    let vts = zigzag_vertices(&agg, &matrix, strength as usize, confirm, need);
+    let mut data: Vec<Point> = Vec::new();
+    for (k, &i) in vts.iter().enumerate() {
+        let v = match agg[i] {
+            Some(v) => v,
+            None => continue,
+        };
+        let color = if k == 0 {
+            flat.clone()
+        } else {
+            let pv = agg[vts[k - 1]].unwrap_or(v);
+            if v > pv {
+                up.clone()
+            } else if v < pv {
+                dn.clone()
+            } else {
+                flat.clone()
+            }
+        };
+        data.push(Point { time: cc[i].time, value: (v * 100.0).round() / 100.0, color: Some(color) });
+    }
+    vec![mk_line(&flat, lw, data, None)]
+}
+
+fn markers_ovlconsensus(c: &[Candle], o: &Settings) -> Vec<Marker> {
+    let up = strv(o, "upColor", "#00e676");
+    let dn = strv(o, "downColor", "#ff5252");
+    let need = num(o, "minAgree", 2.0).round().max(1.0) as usize;
+    let confirm = num(o, "confirm", 5.0).round().max(0.0) as usize;
+    let strength = num(o, "strength", 5.0).round().max(2.0);
+    let cc = clean_candles(c);
+    if cc.len() < 2 {
+        return Vec::new();
+    }
+    let (agg, matrix) = ovl_series_matrix(&cc);
+    let vts = zigzag_vertices(&agg, &matrix, strength as usize, confirm, need);
+    let mut mk: Vec<Marker> = Vec::new();
+    for k in 1..vts.len().saturating_sub(1) {
+        let cur = agg[vts[k]].unwrap_or(0.0);
+        let prev = agg[vts[k - 1]].unwrap_or(cur);
+        let next = agg[vts[k + 1]].unwrap_or(cur);
+        let is_high = cur >= prev && cur >= next;
+        let bull = !is_high;
+        mk.push(Marker {
+            time: cc[vts[k]].time,
+            position: if bull { "belowBar" } else { "aboveBar" }.into(),
+            color: if bull { up.clone() } else { dn.clone() },
+            shape: if bull { "arrowUp" } else { "arrowDown" }.into(),
+            text: if bull { "BULL" } else { "BEAR" }.into(),
+            size: 1.0,
+        });
     }
     mk
 }
@@ -3250,14 +4047,13 @@ pub fn registry() -> Vec<IndicatorEntry> {
         compute_iv, "number"
     ));
     v.push(e!(
-        def("projline", "Trend Projection", "Straight trend-line projection (pivot fit, extended into the future)", "Overlay", IndType::Overlay, None,
+        def("projline", "Trend Projection", "Trend Projection (segment-trend-wise zigzag through the ATR swings, last leg projected into the future)", "Overlay", IndType::Overlay, None,
             vec![num_in("atrPeriod", "ATR period", 14.0, 2.0, 200.0, 1.0),
                  num_in("atrMult", "ATR mult", 2.0, 0.1, 10.0, 0.1),
                  num_in("minPct", "Min pivot %", 0.15, 0.0, 5.0, 0.05),
-                 num_in("fwd", "Project bars", 30.0, 1.0, 500.0, 1.0),
-                 num_in("pivots", "Pivots used", 3.0, 2.0, 50.0, 1.0),
-                 enum_in("mode", "Fit mode", "trendline", &[("trendline", "Trendline"), ("regression", "Regression")])],
-            vec![color_st("histColor", "History color", "#7ee0ff"), color_st("projColor", "Projection color", "#b388ff"),
+                 num_in("fwd", "Project bars", 30.0, 1.0, 500.0, 1.0)],
+            vec![color_st("upColor", "Up color", "#26a69a"), color_st("downColor", "Down color", "#ef5350"),
+                 color_st("histColor", "History color", "#7ee0ff"), color_st("projColor", "Projection color", "#b388ff"),
                  num_st("lineWidth", "Line width", 1.0, 1.0, 5.0, 1.0)]),
         compute_projline, markers_projline, "price"
     ));
@@ -3302,7 +4098,7 @@ pub fn registry() -> Vec<IndicatorEntry> {
         compute_keylevel, "price"
     ));
     v.push(e!(
-        def("autotrend", "Auto Trendline", "Auto Trendline (best-respected support/resistance line through swing pivots)", "Overlay", IndType::Overlay, None,
+        def("autotrend", "Auto Trendline", "Auto Trendline (segment-trend-wise zigzag through the confirmed swing pivots)", "Overlay", IndType::Overlay, None,
             vec![num_in("strength", "Pivot strength", 5.0, 1.0, 50.0, 1.0),
                  num_in("look", "Look back", 60.0, 3.0, 500.0, 1.0),
                  num_in("atrPeriod", "ATR period", 14.0, 2.0, 200.0, 1.0),
@@ -3370,7 +4166,7 @@ pub fn registry() -> Vec<IndicatorEntry> {
         compute_trendmaster, markers_trendmaster, "price"
     ));
     v.push(e!(
-        def("panemaster", "Pane Consensus Signal", "Pane Consensus Signal (all pane oscillators fused into one bullish/bearish straight intersection line)", "Trend", IndType::Overlay, None,
+        def("panemaster", "Pane Consensus Signal", "Pane Consensus Signal (all pane oscillators fused into one segment-trend-wise zigzag line: one straight leg per swing, flipping at every real turn)", "Trend", IndType::Overlay, None,
             vec![num_in("atrPeriod", "ATR period", 14.0, 2.0, 200.0, 1.0),
                  num_in("rsiLength", "RSI length", 14.0, 2.0, 100.0, 1.0),
                  num_in("bbLength", "BB length", 20.0, 2.0, 200.0, 1.0),
@@ -3469,6 +4265,50 @@ pub fn registry() -> Vec<IndicatorEntry> {
         compute_supplydemand, markers_supplydemand, "price"
     ));
     v.push(e!(
+        def("slconsensus", "Straight Line Consensus", "Straight Line Consensus (majority vote of the twelve straight-line indicators drawn as a segment-trend-wise zigzag: one straight leg per aggregate swing, flipping at every real turn)", "Overlay", IndType::Overlay, None,
+            vec![num_in("minAgree", "Min net votes", 2.0, 1.0, 12.0, 1.0),
+                 num_in("confirm", "Confirm bars", 5.0, 0.0, 30.0, 1.0),
+                 num_in("strength", "Swing strength", 5.0, 2.0, 50.0, 1.0)],
+            vec![color_st("upColor", "Bull color", "#00e676"), color_st("downColor", "Bear color", "#ff5252"),
+                 color_st("flatColor", "Flat color", "#6b6b88"), num_st("lineWidth", "Line width", 2.0, 1.0, 5.0, 1.0)]),
+        compute_slconsensus, markers_slconsensus, "price"
+    ));
+    v.push(e!(
+        def("ovlconsensus", "Overlay Consensus", "Overlay Consensus (the twelve classic overlay indicators - EMA, MA, SMMA, HMA, Bollinger, Keltner, Price Channel, Donchian, Chandelier, Ichimoku, Supertrend, VWAP - averaged and drawn as a segment-trend-wise zigzag: one straight leg per aggregate swing, flipping at every real turn)", "Overlay", IndType::Overlay, None,
+            vec![num_in("minAgree", "Min agree", 2.0, 1.0, 12.0, 1.0),
+                 num_in("confirm", "Min leg bars", 5.0, 0.0, 30.0, 1.0),
+                 num_in("strength", "Pivot strength", 5.0, 2.0, 50.0, 1.0)],
+            vec![color_st("upColor", "Bull color", "#00e676"), color_st("downColor", "Bear color", "#ff5252"),
+                 color_st("flatColor", "Flat color", "#6b6b88"), num_st("lineWidth", "Line width", 2.0, 1.0, 5.0, 1.0)]),
+        compute_ovlconsensus, markers_ovlconsensus, "price"
+    ));
+    v.push(e!(
+        def("supline", "Support Trendline", "Support Trendline (single straight line through multiple swing lows, extended forward)", "Overlay", IndType::Overlay, None,
+            vec![num_in("strength", "Pivot strength", 5.0, 2.0, 50.0, 1.0),
+                 num_in("atrPeriod", "ATR period", 14.0, 2.0, 200.0, 1.0),
+                 num_in("minPct", "Min tol %", 0.05, 0.0, 5.0, 0.05),
+                 num_in("tolMult", "Tol ATR mult", 0.5, 0.0, 10.0, 0.1),
+                 num_in("look", "Pivots to scan", 12.0, 3.0, 400.0, 1.0),
+                 num_in("fwd", "Forward bars", 10.0, 0.0, 200.0, 1.0),
+                 check_in("fullSpan", "Full span", false)],
+            vec![color_st("upColor", "Rising color", "#26a69a"), color_st("downColor", "Falling color", "#ef5350"),
+                 num_st("lineWidth", "Line width", 2.0, 1.0, 5.0, 1.0)]),
+        compute_supline, markers_supline, "price"
+    ));
+    v.push(e!(
+        def("resline", "Resistance Trendline", "Resistance Trendline (single straight line through multiple swing highs, extended forward)", "Overlay", IndType::Overlay, None,
+            vec![num_in("strength", "Pivot strength", 5.0, 2.0, 50.0, 1.0),
+                 num_in("atrPeriod", "ATR period", 14.0, 2.0, 200.0, 1.0),
+                 num_in("minPct", "Min tol %", 0.05, 0.0, 5.0, 0.05),
+                 num_in("tolMult", "Tol ATR mult", 0.5, 0.0, 10.0, 0.1),
+                 num_in("look", "Pivots to scan", 12.0, 3.0, 400.0, 1.0),
+                 num_in("fwd", "Forward bars", 10.0, 0.0, 200.0, 1.0),
+                 check_in("fullSpan", "Full span", false)],
+            vec![color_st("upColor", "Rising color", "#26a69a"), color_st("downColor", "Falling color", "#ef5350"),
+                 num_st("lineWidth", "Line width", 2.0, 1.0, 5.0, 1.0)]),
+        compute_resline, markers_resline, "price"
+    ));
+    v.push(e!(
         def("vl", "VL", "Volume Line (volume-weighted trend, battery fade)", "Volume", IndType::Overlay, None,
             vec![num_in("length", "Length", 14.0, 1.0, 200.0, 1.0),
                  num_in("signalLen", "Signal length", 9.0, 1.0, 100.0, 1.0),
@@ -3550,6 +4390,38 @@ mod tests {
     }
 
     #[test]
+    fn support_trendline_touches_multiple_lows() {
+        // Clean sawtooth whose swing lows sit exactly on y = 100 + 0.2*i. The
+        // support line must pass through (touch) at least three of those lows.
+        let mut candles = Vec::new();
+        for i in 0..300 {
+            let base = 100.0 + 0.2 * i as f64;
+            let phase = (i % 20) as f64;
+            let tri = if phase < 10.0 { phase } else { 20.0 - phase };
+            let close = base + tri;
+            candles.push(Candle { time: i as i64 * 300, open: close - 0.2, high: close + 0.3, low: close - 0.3, close, volume: 1000.0 });
+        }
+        let reg = registry();
+        let e = reg.iter().find(|e| e.def.id == "supline").unwrap();
+        let out = (e.compute)(&candles, &defaults(e));
+        let line = out.first().unwrap();
+        let cc = clean_candles(&candles);
+        let start = cc.iter().position(|c| c.time == line.data[0].time).unwrap();
+        let slope = line.data[1].value - line.data[0].value;
+        let b = line.data[0].value - slope * start as f64;
+        let piv = fractal_pivots(&cc, 5.0);
+        let touched = piv
+            .iter()
+            .filter(|p| !p.is_high)
+            .filter(|p| {
+                let v = slope * p.idx as f64 + b;
+                (v - p.price).abs() <= 1.0
+            })
+            .count();
+        assert!(touched >= 3, "support line must touch at least 3 swing lows, got {touched}");
+    }
+
+    #[test]
     fn straight_line_arrow_markers_flip_with_direction() {
         // Arrow markers are printed exactly where a line's slope changes sign.
         let mut line = SeriesOut::line("#26a69a", 1.0);
@@ -3584,6 +4456,213 @@ mod tests {
             let mk = (e.markers.unwrap())(&candles, &defaults(e));
             assert!(!mk.is_empty(), "{id} must emit trend-start arrows on a real oscillating series, got 0");
         }
+    }
+
+    #[test]
+    fn straight_line_consensus_line_stays_within_price_range() {
+        // The consensus line is now a segment-trend-wise zigzag: each leg joins
+        // two swing turns. The line must run through the candle bodies rather
+        // than floating away from them, and must reach the latest candle.
+        let mut candles = Vec::new();
+        for i in 0..400 {
+            let base = 100.0 + 0.5 * i as f64 + ((i as f64) * 0.35).sin() * 0.6;
+            candles.push(Candle {
+                time: i as i64 * 300,
+                open: base - 0.1,
+                high: base + 0.9,
+                low: base - 0.9,
+                close: base,
+                volume: 1000.0,
+            });
+        }
+        let reg = registry();
+        let e = reg.iter().find(|e| e.def.id == "slconsensus").unwrap();
+        let out = (e.compute)(&candles, &defaults(e));
+        let line = out.first().expect("consensus line series");
+        assert!(!line.data.is_empty(), "consensus line must have data on a real series");
+        let cc = clean_candles(&candles);
+        let by_time: std::collections::BTreeMap<i64, usize> =
+            cc.iter().enumerate().map(|(i, c)| (c.time, i)).collect();
+        let pts: Vec<(usize, f64)> = line.data.iter().map(|p| (by_time[&p.time], p.value)).collect();
+        let inside = pts.iter().filter(|(i, v)| *v >= cc[*i].low - 1e-6 && *v <= cc[*i].high + 1e-6).count();
+        let frac = inside as f64 / pts.len().max(1) as f64;
+        assert!(frac >= 0.9, "consensus line should cut through candles, only {frac:.2} inside");
+        assert!(
+            line.data.last().unwrap().value > line.data.first().unwrap().value,
+            "consensus line must rise with the up-trend"
+        );
+        assert_eq!(
+            line.data.last().unwrap().time,
+            cc.last().unwrap().time,
+            "consensus line must reach the most recent candle"
+        );
+    }
+
+    #[test]
+    fn straight_line_consensus_rises_on_a_ramp() {
+        // A monotonic up-ramp must draw a rising line (colour/direction match
+        // the trend), not an inverted one.
+        let mut candles = Vec::new();
+        for i in 0..300 {
+            let c = 100.0 + i as f64 * 0.5;
+            candles.push(Candle { time: i as i64 * 300, open: c - 0.4, high: c + 0.6, low: c - 0.6, close: c, volume: 1000.0 });
+        }
+        let reg = registry();
+        let e = reg.iter().find(|e| e.def.id == "slconsensus").unwrap();
+        let out = (e.compute)(&candles, &defaults(e));
+        let line = out.first().unwrap();
+        let first = line.data.first().unwrap().value;
+        let last = line.data.last().unwrap().value;
+        assert!(last > first, "line must rise with an up-ramp: first={first} last={last}");
+        // Segment-trend-wise: a monotonic ramp is one straight leg from first to
+        // last vertex, so the plotted vertices must strictly rise (never a flat
+        // plate, which the old least-squares anchor could sit on).
+        assert!(line.data.len() >= 2, "ramp must draw at least the two end vertices");
+        for w in line.data.windows(2) {
+            assert!(
+                w[1].value >= w[0].value,
+                "ramp line must not fall back: {} -> {}",
+                w[0].value,
+                w[1].value
+            );
+        }
+    }
+
+    #[test]
+    fn pane_consensus_draws_a_price_anchored_zigzag() {
+        // Pane Consensus now draws a segment-trend-wise zigzag anchored to the
+        // candles (not one least-squares line per regime), so every vertex must
+        // sit inside the candle body and the line must reach the latest bar.
+        let candles = synth(400);
+        let reg = registry();
+        let e = reg.iter().find(|e| e.def.id == "panemaster").unwrap();
+        let out = (e.compute)(&candles, &defaults(e));
+        let line = out.first().expect("pane consensus series");
+        assert!(!line.data.is_empty(), "pane consensus must draw a zigzag");
+        let cc = clean_candles(&candles);
+        for p in &line.data {
+            let c = cc.iter().find(|c| c.time == p.time).unwrap();
+            assert!(
+                p.value >= c.low - 1e-6 && p.value <= c.high + 1e-6,
+                "pane zigzag must cut through candle bodies: {} not in [{}, {}]",
+                p.value,
+                c.low,
+                c.high
+            );
+        }
+        assert_eq!(
+            line.data.last().unwrap().time,
+            cc.last().unwrap().time,
+            "pane zigzag must reach the latest candle"
+        );
+    }
+
+    #[test]
+    fn auto_trendline_and_projection_draw_multi_leg_zigzags() {
+        // Both were constant-slope fit lines; they must now be segment-trend-wise
+        // zigzags that reach the latest bar.
+        let candles = synth(400);
+        let cc = clean_candles(&candles);
+        let reg = registry();
+        for id in ["autotrend", "projline"] {
+            let e = reg.iter().find(|e| e.def.id == id).unwrap();
+            let out = (e.compute)(&candles, &defaults(e));
+            let hist = out.first().unwrap();
+            assert!(
+                hist.data.len() >= 3,
+                "{id} must draw a multi-leg zigzag, got {} points",
+                hist.data.len()
+            );
+            assert_eq!(
+                hist.data.last().unwrap().time,
+                cc.last().unwrap().time,
+                "{id} zigzag must reach the latest candle"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_consensus_fuses_the_twelve_overlays_into_a_rising_line() {
+        let mut candles = Vec::new();
+        for i in 0..300 {
+            let c = 100.0 + i as f64 * 0.5;
+            candles.push(Candle { time: i as i64 * 300, open: c - 0.4, high: c + 0.6, low: c - 0.6, close: c, volume: 1000.0 });
+        }
+        let cc = clean_candles(&candles);
+        let dir = ovl_consensus_dir(&cc, 2, 5, 5.0);
+        assert_eq!(dir.last().copied(), Some(1), "overlay consensus must resolve bullish on an up-ramp");
+        let reg = registry();
+        let e = reg.iter().find(|e| e.def.id == "ovlconsensus").unwrap();
+        let out = (e.compute)(&candles, &defaults(e));
+        let line = out.first().unwrap();
+        assert!(!line.data.is_empty(), "overlay consensus must draw a line");
+        assert!(
+            line.data.last().unwrap().value > line.data.first().unwrap().value,
+            "overlay consensus line must rise with the up-ramp"
+        );
+    }
+
+    #[test]
+    fn straight_line_consensus_confirm_delays_flips_and_reaches_last_bar() {
+        // A larger confirmation window must never add flips (hysteresis can only
+        // hold a trend longer), and the drawn line must extend to the latest
+        // candle so it tracks the trend right up to the last bar.
+        let candles = synth(400);
+        let fast = sl_consensus_dir(&candles, 2, 1, 5.0);
+        let slow = sl_consensus_dir(&candles, 2, 8, 5.0);
+        let flips = |d: &[i32]| d.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(flips(&slow) <= flips(&fast), "confirm must not increase flips");
+        let reg = registry();
+        let e = reg.iter().find(|e| e.def.id == "slconsensus").unwrap();
+        let out = (e.compute)(&candles, &defaults(e));
+        let line = out.first().unwrap();
+        let cc = clean_candles(&candles);
+        assert_eq!(
+            line.data.last().unwrap().time,
+            cc.last().unwrap().time,
+            "consensus line must reach the most recent candle"
+        );
+    }
+
+    #[test]
+    fn support_and_resistance_trendlines_are_separate_lines() {
+        // Two independent indicators: one straight line through swing lows, one
+        // through swing highs. They must be distinct, with support below price
+        // and resistance above it on an oscillating series.
+        let candles = synth(500);
+        let reg = registry();
+        let sup = reg.iter().find(|e| e.def.id == "supline").unwrap();
+        let res = reg.iter().find(|e| e.def.id == "resline").unwrap();
+        let so = (sup.compute)(&candles, &defaults(sup));
+        let ro = (res.compute)(&candles, &defaults(res));
+        let s = so.first().expect("support line");
+        let r = ro.first().expect("resistance line");
+        assert!(s.data.len() > 2, "support line must be drawn");
+        assert!(r.data.len() > 2, "resistance line must be drawn");
+        let smean = s.data.iter().map(|p| p.value).sum::<f64>() / s.data.len() as f64;
+        let rmean = r.data.iter().map(|p| p.value).sum::<f64>() / r.data.len() as f64;
+        assert!(smean < rmean, "support line ({smean}) must sit below resistance ({rmean})");
+        // The line must be near the current price band, not projected far away
+        // from the chart (the old bug that pushed the candles into a sliver).
+        let last_t = candles.last().unwrap().time;
+        let last_close = candles.last().unwrap().close;
+        let lo = candles.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
+        let hi = candles.iter().map(|c| c.high).fold(f64::NEG_INFINITY, f64::max);
+        let range = hi - lo;
+        let s_last = s.data.iter().find(|p| p.time == last_t).expect("support line covers the last bar").value;
+        let r_last = r.data.iter().find(|p| p.time == last_t).expect("resistance line covers the last bar").value;
+        assert!(s_last <= last_close + range * 0.05, "support line {s_last} must not sit above price {last_close}");
+        assert!(r_last >= last_close - range * 0.05, "resistance line {r_last} must not sit below price {last_close}");
+        for (name, v) in [("support", s_last), ("resistance", r_last)] {
+            assert!(
+                v >= lo - range * 0.15 && v <= hi + range * 0.15,
+                "{name} line {v} projected outside the price band [{lo}, {hi}]"
+            );
+        }
+        let smk = (sup.markers.unwrap())(&candles, &defaults(sup));
+        let rmk = (res.markers.unwrap())(&candles, &defaults(res));
+        assert!(!smk.is_empty(), "support trendline must expose arrows");
+        assert!(!rmk.is_empty(), "resistance trendline must expose arrows");
     }
 
     fn trend_then_drop() -> Vec<Candle> {
@@ -3645,8 +4724,10 @@ mod tests {
     #[test]
     fn registry_matches_old_app_catalog() {
         let reg = registry();
-        // 65 old-app indicators + 27 candlestick patterns (crate::patterns).
-        assert_eq!(reg.len(), 92);
+        // 69 old-app indicators (65 + straight-line consensus, support and
+        // resistance trendlines, overlay consensus) + 27 candlestick patterns
+        // (crate::patterns).
+        assert_eq!(reg.len(), 96);
         let find = |id: &str| reg.iter().find(|e| e.def.id == id).unwrap();
         for id in ["pcr", "pcrrail", "iv", "panemaster", "ewtrend", "patrend", "sremat"] {
             assert_eq!(find(id).def.kind, IndType::Overlay, "{id} must be an overlay");

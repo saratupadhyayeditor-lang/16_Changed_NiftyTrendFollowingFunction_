@@ -684,7 +684,13 @@ fn load_chart_preserve(preserve_view: bool) {
             app.last_bar = ((js_sys::Date::now() / 1000.0) as i64) / step;
             app.bar_vol_base = 0.0;
             app.local_bar = false;
-            if !preserve_view {
+            // A preserve load that lands on an empty chart has no viewport to
+            // preserve: a fresh symbol/timeframe load cleared the candles and
+            // this load superseded it (the 1s ticker fires one the instant the
+            // timeframe changes). Without a fresh fit, the previous timeframe's
+            // `view_start` - an index near the end of a *shorter* series - is
+            // reused on the new, longer series and the chart snaps days back.
+            if !preserve_view || old_n <= 0.0 {
                 app.fit_recent();
             } else if anchored {
                 let n = app.candles.len() as f64;

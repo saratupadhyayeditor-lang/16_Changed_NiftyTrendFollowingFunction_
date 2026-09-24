@@ -15,6 +15,7 @@ import { istTime } from "./ist.js?v=1";
 
 const API = {
   snapshot: () => get("/api/rt/snapshot"),
+  closed: () => get("/api/rt/closed"),
   pool: (force) => get("/api/rt/pool" + (force ? "?refresh=1" : "")),
   movers: () => get("/api/rt/movers"),
   trend: () => get("/api/rt/trend"),
@@ -107,6 +108,32 @@ const METHODS = [
 ];
 
 let STATE = null;
+// Guards against the 1s snapshot poll clobbering UI the user just touched.
+// `refreshSeq` drops out-of-order snapshot responses; `filtersBusy` freezes the
+// Bullish/Bearish checkbox row while its save round-trips, so a snapshot that
+// was fetched before the click can never revert the tick.
+let refreshSeq = 0;
+// A snapshot response can be large and the poll is only 1s. Without this guard a
+// slow/tunneled link lets a new poll start before the previous response lands, so
+// every response looks "stale" and is dropped -> the whole pane freezes. Keep one
+// snapshot in flight at a time; a request made while one is running is queued and
+// run immediately after, so a button-driven refresh never gets lost.
+let refreshInFlight = false;
+let refreshQueued = false;
+let filtersBusy = false;
+// The per-second snapshot only carries the newest slice of the closed ledger;
+// the full (uncapped) ledger is paged in on demand via `/closed` and cached here.
+let CLOSED_CACHE = null;
+let closedLoading = false;
+let closedLoadedAt = 0;
+// Signature of what is currently painted in the big tables. The 1s poll rebuilds
+// the whole DOM for the closed ledger (thousands of rows) and the condition log;
+// doing that every second is what made the pane hang. Skip the rebuild when the
+// underlying data has not changed since the last paint.
+let closedRenderSig = "";
+let logRenderSig = "";
+let scannerPollAt = 0;
+const CLOSED_SNAPSHOT_SLICE = 100;
 let CATALOG = { indicators: [], timeframes: [], symbols: [] };
 let activeMethod = "normal";
 let methodInit = false;
@@ -440,6 +467,9 @@ function _filterLayout(isBull) {
       ["GannFan", "Gann Fan line"], ["FibFan", "Fibonacci Fan line"], ["Srema", "S/R EMA Reversal line"],
     ].map(([tok, name]) => [`${B}Sl${tok}`, sl(name)]).concat([
       [`${B}Vl`, sl("Volume line")],
+      [`${B}SlConsensus`, sl("Straight Line Consensus line")],
+      [`${B}SlSupport`, sl("Support Trendline")],
+      [`${B}SlResistance`, sl("Resistance Trendline")],
     ]),
   });
 
@@ -456,6 +486,8 @@ function _filterLayout(isBull) {
       ["TrendProjection", "Trend Projection line arrow"], ["GannFan", "Gann Fan line arrow"],
       ["FibFan", "Fibonacci Fan line arrow"], ["Srema", "S/R EMA Reversal line arrow"],
       ["TrendCore", "Trend Core line arrow"], ["Oit", "OI Trend arrow"], ["Vl", "Volume line arrow"],
+      ["Consensus", "Straight Line Consensus line arrow"],
+      ["Support", "Support Trendline arrow"], ["Resistance", "Resistance Trendline arrow"],
     ].map(([tok, name]) => [`${B}Arrow${tok}`, name]),
   });
 
@@ -508,7 +540,17 @@ function filterSectionHTML(side) {
         ? `<div style="border-top:1px solid #2d2d50;margin-top:2px;padding-top:3px;font-size:8px;color:#ffd700">${esc(sec.head)}</div>`
         : "";
       const rows = sec.rows
-        .map((f) => `<label style="font-size:9px;color:#ccc;display:flex;align-items:center;gap:3px"><input type="checkbox" data-filter="${f[0]}"> ${esc(f[1])}</label>`)
+        .map((f) => {
+          let gear = "";
+          if (/SlConsensus$/.test(f[0]) || /ArrowConsensus$/.test(f[0])) {
+            gear = `<span class="sc-gear" title="Straight Line Consensus settings" style="cursor:pointer;color:#ffd700;font-size:11px;line-height:1">&#9881;</span>`;
+          } else if (/SlSupport$/.test(f[0])) {
+            gear = `<span class="pt-gear" data-pt="support" title="Support Trendline settings" style="cursor:pointer;color:#26a69a;font-size:11px;line-height:1">&#9881;</span>`;
+          } else if (/SlResistance$/.test(f[0])) {
+            gear = `<span class="pt-gear" data-pt="resistance" title="Resistance Trendline settings" style="cursor:pointer;color:#ef5350;font-size:11px;line-height:1">&#9881;</span>`;
+          }
+          return `<div style="display:flex;align-items:center;gap:3px"><label style="font-size:9px;color:#ccc;display:flex;align-items:center;gap:3px;flex:1"><input type="checkbox" data-filter="${f[0]}"> ${esc(f[1])}</label>${gear}</div>`;
+        })
         .join("");
       return head + rows;
     })
@@ -600,6 +642,178 @@ function uiAlert(msg) {
   return uiDialog(msg, { alertOnly: true });
 }
 
+// Single working "Square Off All Trades" action shared by both tabs (shared
+// module: the Paper frame rewrites /api/rt -> /api/paper, so the same call
+// squares off the simulated book there). It closes every running engine trade at
+// market and, on the real tab, also flattens any broker manual/residual qty.
+async function squareOffAllTrades() {
+  const pos = (STATE && STATE.positions) || [];
+  const n = pos.length;
+  const msg = PAPER
+    ? "Square Off ALL running paper trades at market?\n\nSimulated exits - koi real Dhan order nahi jayega." +
+      (n ? "\n\n" + n + " running trade(s) close honge." : "\n\nAbhi koi running trade nahi hai.")
+    : "Square Off ALL running trades at market?\n\nExits WILL be sent to Dhan." +
+      (n ? "\n\n" + n + " running trade(s) close honge." : "");
+  if (!(await uiConfirm(msg, { danger: true }))) return;
+  try {
+    await API.squareOff();
+  } catch (e) {
+    await uiAlert("Square Off All Trades failed: " + (e && e.message ? e.message : e));
+    return;
+  }
+  if (typeof refresh === "function") refresh();
+}
+
+// Per-filter settings for the "Straight Line Consensus" indicator filter. These
+// are the values the engine's Consensus filter rows use (default 0 = flip the
+// instant the majority vote flips). Kept separate from the chart indicator's own
+// settings; the values live in settings + hidden [data-set] inputs so a generic
+// settings save never erases them.
+function openConsensusSettings() {
+  const s = (STATE && STATE.settings) || {};
+  const v = (k, d) => (s[k] == null || s[k] === "" ? d : s[k]);
+  let back = document.getElementById("rtScBackdrop");
+  if (back) back.remove();
+  back = document.createElement("div");
+  back.id = "rtScBackdrop";
+  back.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100000;display:flex;align-items:center;justify-content:center";
+  back.innerHTML =
+    '<div style="background:#12122a;border:1px solid #3d3d6b;border-radius:8px;padding:14px 16px;min-width:310px;color:#eaeaf5">' +
+    '<div style="font-weight:700;color:#ffd700;margin-bottom:8px">Straight Line Consensus Settings</div>' +
+    '<div style="display:grid;grid-template-columns:1fr 100px;gap:6px;align-items:center;font-size:11px">' +
+    '<span>Min net votes</span><input type="number" id="scMinAgree" min="0" max="12" step="1" value="' + v("scMinAgree", 0) + '">' +
+    '<span>Confirm bars</span><input type="number" id="scConfirm" min="0" max="30" step="1" value="' + v("scConfirm", 0) + '">' +
+    '<span>Swing strength</span><input type="number" id="scStrength" min="0" max="50" step="1" value="' + v("scStrength", 0) + '">' +
+    '<span>Bull color</span><input type="color" id="scUpColor" value="' + v("scUpColor", "#00e676") + '">' +
+    '<span>Bear color</span><input type="color" id="scDownColor" value="' + v("scDownColor", "#ff5252") + '">' +
+    '<span>Flat color</span><input type="color" id="scFlatColor" value="' + v("scFlatColor", "#6b6b88") + '">' +
+    '<span>Line width</span><input type="number" id="scLineWidth" min="1" max="5" step="1" value="' + v("scLineWidth", 2) + '">' +
+    "</div>" +
+    '<div style="font-size:9px;color:#888;margin-top:8px">0 = Min votes 0, Confirm 0, Swing strength 0 par filter turant vote flip par chalta hai.</div>' +
+    '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">' +
+    '<button class="btn-action" id="scCancel">Cancel</button>' +
+    '<button class="btn-action" id="scSave" style="background:#00d4aa;color:#0a0a18;font-weight:700">Save</button>' +
+    "</div></div>";
+  document.body.appendChild(back);
+  const close = () => back.remove();
+  back.onclick = (e) => { if (e.target === back) close(); };
+  document.getElementById("scCancel").onclick = close;
+  document.getElementById("scSave").onclick = () => {
+    const g = (id) => document.getElementById(id).value;
+    const fields = {
+      scMinAgree: num(g("scMinAgree")),
+      scConfirm: num(g("scConfirm")),
+      scStrength: num(g("scStrength")),
+      scUpColor: g("scUpColor"),
+      scDownColor: g("scDownColor"),
+      scFlatColor: g("scFlatColor"),
+      scLineWidth: num(g("scLineWidth")),
+    };
+    Object.keys(fields).forEach((k) => {
+      const hi = document.querySelector('#tab-realtime [data-set="' + k + '"]');
+      if (hi) hi.value = fields[k];
+    });
+    close();
+    API.settings(Object.assign({}, (STATE && STATE.settings) || {}, fields)).then(refresh);
+  };
+}
+
+// Per-filter settings for the Support / Resistance Trendline indicator filters.
+// These are the geometry inputs the engine's SlSupport / SlResistance filter rows
+// use to fit the line (Pivot strength / ATR period / Min tol % / Tol ATR mult /
+// Pivots to scan / Forward bars / Full span). Colours / line width are kept for
+// parity with the chart indicator's own settings panel. Values live in settings +
+// hidden [data-set] inputs so a generic settings save never erases them.
+const PT_DEFAULTS = {
+  strength: 5,
+  atrPeriod: 14,
+  minPct: 0.05,
+  tolMult: 0.5,
+  look: 12,
+  fwd: 10,
+  fullSpan: false,
+  upColor: "#26a69a",
+  downColor: "#ef5350",
+  lineWidth: 2,
+};
+
+function openPivotTrendSettings(kind) {
+  const sup = kind === "support";
+  const p = sup ? "sup" : "res";
+  const cap = sup ? "Support" : "Resistance";
+  const s = (STATE && STATE.settings) || {};
+  const key = (f) => p + f.charAt(0).toUpperCase() + f.slice(1);
+  const v = (f) => (s[key(f)] == null || s[key(f)] === "" ? PT_DEFAULTS[f] : s[key(f)]);
+  const backId = "rtPtBackdrop";
+  let back = document.getElementById(backId);
+  if (back) back.remove();
+  back = document.createElement("div");
+  back.id = backId;
+  back.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100000;display:flex;align-items:center;justify-content:center";
+  back.innerHTML =
+    '<div style="background:#12122a;border:1px solid #3d3d6b;border-radius:8px;padding:14px 16px;min-width:310px;color:#eaeaf5">' +
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px"><span style="font-weight:700;color:' + (sup ? "#26a69a" : "#ef5350") + '">' + cap + ' Trendline Settings</span><span id="ptClose" style="cursor:pointer;color:#888;font-size:14px;line-height:1">&#10005;</span></div>' +
+    '<div style="display:grid;grid-template-columns:1fr 100px;gap:6px;align-items:center;font-size:11px">' +
+    '<span>Pivot strength</span><input type="number" id="ptStrength" min="2" max="50" step="1" value="' + v("strength") + '">' +
+    '<span>ATR period</span><input type="number" id="ptAtrPeriod" min="2" max="200" step="1" value="' + v("atrPeriod") + '">' +
+    '<span>Min tol %</span><input type="number" id="ptMinPct" min="0" max="5" step="0.05" value="' + v("minPct") + '">' +
+    '<span>Tol ATR mult</span><input type="number" id="ptTolMult" min="0" max="10" step="0.1" value="' + v("tolMult") + '">' +
+    '<span>Pivots to scan</span><input type="number" id="ptLook" min="3" max="400" step="1" value="' + v("look") + '">' +
+    '<span>Forward bars</span><input type="number" id="ptFwd" min="0" max="200" step="1" value="' + v("fwd") + '">' +
+    '<span>Full span</span><input type="checkbox" id="ptFullSpan"' + (v("fullSpan") ? " checked" : "") + ">" +
+    '<span>Rising color</span><input type="color" id="ptUpColor" value="' + v("upColor") + '">' +
+    '<span>Falling color</span><input type="color" id="ptDownColor" value="' + v("downColor") + '">' +
+    '<span>Line width</span><input type="number" id="ptLineWidth" min="1" max="5" step="1" value="' + v("lineWidth") + '">' +
+    "</div>" +
+    '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">' +
+    '<button class="btn-action" id="ptReset">Reset</button>' +
+    '<button class="btn-action" id="ptCancel">Cancel</button>' +
+    '<button class="btn-action" id="ptSave" style="background:#00d4aa;color:#0a0a18;font-weight:700">Save</button>' +
+    "</div></div>";
+  document.body.appendChild(back);
+  const close = () => back.remove();
+  const g = (id) => document.getElementById(id);
+  const setFields = (src) => {
+    g("ptStrength").value = src.strength;
+    g("ptAtrPeriod").value = src.atrPeriod;
+    g("ptMinPct").value = src.minPct;
+    g("ptTolMult").value = src.tolMult;
+    g("ptLook").value = src.look;
+    g("ptFwd").value = src.fwd;
+    g("ptFullSpan").checked = !!src.fullSpan;
+    g("ptUpColor").value = src.upColor;
+    g("ptDownColor").value = src.downColor;
+    g("ptLineWidth").value = src.lineWidth;
+  };
+  back.onclick = (e) => { if (e.target === back) close(); };
+  g("ptClose").onclick = close;
+  g("ptCancel").onclick = close;
+  g("ptReset").onclick = () => setFields(PT_DEFAULTS);
+  g("ptSave").onclick = () => {
+    const fields = {
+      [key("strength")]: num(g("ptStrength").value),
+      [key("atrPeriod")]: num(g("ptAtrPeriod").value),
+      [key("minPct")]: num(g("ptMinPct").value),
+      [key("tolMult")]: num(g("ptTolMult").value),
+      [key("look")]: num(g("ptLook").value),
+      [key("fwd")]: num(g("ptFwd").value),
+      [key("fullSpan")]: g("ptFullSpan").checked,
+      [key("upColor")]: g("ptUpColor").value,
+      [key("downColor")]: g("ptDownColor").value,
+      [key("lineWidth")]: num(g("ptLineWidth").value),
+    };
+    Object.keys(fields).forEach((k) => {
+      const hi = document.querySelector('#tab-realtime [data-set="' + k + '"]');
+      if (hi) {
+        if (hi.type === "checkbox") hi.checked = !!fields[k];
+        else hi.value = fields[k];
+      }
+    });
+    close();
+    API.settings(Object.assign({}, (STATE && STATE.settings) || {}, fields)).then(refresh);
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Styles
 // ---------------------------------------------------------------------------
@@ -661,7 +875,7 @@ function shell() {
       <span class="rt-pill" id="rtFundsPill">Funds: --</span>
       <span style="flex:1"></span>
       <button class="btn-action" id="rtRefreshAccount" style="width:auto;padding:3px 10px;margin:0 4px 0 0;font-size:10px">Refresh Account</button>
-      <button class="btn-action" id="rtSquareOff" style="width:auto;padding:3px 10px;margin:0;font-size:10px;background:#5e2d2d;border-color:#7e3d3d">Square Off All</button>
+      <button class="btn-action" id="rtSquareOff" style="width:auto;padding:3px 10px;margin:0;font-size:10px;background:#8a1f1f;border-color:#b03030;font-weight:700;color:#fff">Square Off All Trades</button>
     </div>
 
     <div class="monitor-toolbar" id="rtAstTplRunSection" style="border:1px solid #4a2d7e;border-radius:4px;margin:4px 0;padding:6px 8px;background:#0d0d1e">
@@ -678,7 +892,7 @@ function shell() {
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
         <h3 class="rt-title">Running Strategies &amp; Trades</h3>
         <button class="btn-action" style="width:auto;padding:3px 10px;margin:0;font-size:10px" data-act="runref">Refresh</button>
-        <button class="btn-action warn" style="width:auto;padding:3px 10px;margin:0;font-size:10px" data-act="closeall">Close All Trades</button>
+        <button class="btn-action warn" style="width:auto;padding:3px 10px;margin:0;font-size:10px" data-act="closeall">Square Off All Trades</button>
         <button class="btn-action warn" style="width:auto;padding:3px 10px;margin:0;font-size:10px" data-act="stoplall">Stop All Strategies</button>
       </div>
       <div id="rtMarginBar" style="display:none;align-items:center;gap:12px;flex-wrap:wrap;margin-top:4px;padding:4px 8px;background:#0d0d1e;border:1px solid #1e1e40;border-radius:3px;font-size:11px"></div>
@@ -1015,6 +1229,12 @@ function shell() {
           </div>
           ${filterSectionHTML("Bear")}
         </div>
+        <div style="display:none">
+          <input type="number" data-set="scMinAgree"><input type="number" data-set="scConfirm"><input type="number" data-set="scStrength">
+          <input type="text" data-set="scUpColor"><input type="text" data-set="scDownColor"><input type="text" data-set="scFlatColor"><input type="number" data-set="scLineWidth">
+          <input type="number" data-set="supStrength"><input type="number" data-set="supAtrPeriod"><input type="number" data-set="supMinPct"><input type="number" data-set="supTolMult"><input type="number" data-set="supLook"><input type="number" data-set="supFwd"><input type="checkbox" data-set="supFullSpan"><input type="text" data-set="supUpColor"><input type="text" data-set="supDownColor"><input type="number" data-set="supLineWidth">
+          <input type="number" data-set="resStrength"><input type="number" data-set="resAtrPeriod"><input type="number" data-set="resMinPct"><input type="number" data-set="resTolMult"><input type="number" data-set="resLook"><input type="number" data-set="resFwd"><input type="checkbox" data-set="resFullSpan"><input type="text" data-set="resUpColor"><input type="text" data-set="resDownColor"><input type="number" data-set="resLineWidth">
+        </div>
       </div>
 
       <div class="rt-engine-row" id="rtRunInRow2" style="border-top:1px dashed #1e1e40">
@@ -1032,8 +1252,8 @@ function shell() {
         <label class="rtom-f" style="color:#b39ddb" title="Indicator-filters trading mode. When ON the normal Run Paper Trading button is faded/inactive.">
           <input type="checkbox" id="rtFilterModeCb"> Indicator-filters mode
         </label>
-        <button class="btn-action" id="rtFilterPaperBtn" style="width:auto;padding:6px 16px;margin:0;background:#b39ddb;color:#0a0a18;font-weight:700">Place trades based on Indicator filters: All together (strict AND)</button>
-        <span style="font-size:9px;color:#888;flex-basis:100%">Run the ticked strategies - normal mode runs the ticked strategies, Indicator-filters mode trades the scanner universe (Top Movers / NIFTY trend / Commodities) only when ALL selected Bullish/Bearish indicator filters pass together. Paper trades are simulated (no real Dhan orders).</span>
+        <button class="btn-action" id="rtFilterPaperBtn" style="width:auto;padding:6px 16px;margin:0;background:#b39ddb;color:#0a0a18;font-weight:700">Place trades based on Indicator filters</button>
+        <span style="font-size:9px;color:#888;flex-basis:100%">Run the ticked strategies - normal mode runs the ticked strategies, Indicator-filters mode trades the scanner universe (Top Movers / NIFTY trend / Commodities) when the Indicator filters agree by majority; tick "All together (strict AND)" to require ALL selected filters, or enable AI Brain (score + conflict veto) for a confluence threshold. Paper trades are simulated (no real Dhan orders).</span>
       </div>
 
       <div class="account-section" id="rtCondLogSection" style="overflow-y:auto;border-top:1px solid #ffd700;margin-top:8px;padding-top:6px">
@@ -1433,11 +1653,12 @@ function pushSetting(partial) {
 
 // --- Run mode (old AST run-mode section) --------------------------------
 // Normal mode runs the ticked strategies; Indicator-filters mode trades the
-// scanner universe (Top Movers / NIFTY trend / Commodities) with every ticked
-// Bullish/Bearish indicator filter passing together (strict AND). Exactly one
-// mode is active: ticking a mode's checkbox activates it (the other fades and
-// becomes inactive); unticking one switches to the other so a mode is always
-// selected.
+// scanner universe (Top Movers / NIFTY trend / Commodities) with the ticked
+// Bullish/Bearish indicator filters agreeing by majority (tick "All together
+// (strict AND)" to require every one, or enable AI Brain for a score/veto gate).
+// Exactly one mode is active: ticking a mode's checkbox activates it (the other
+// fades and becomes inactive); unticking one switches to the other so a mode is
+// always selected.
 function runModeIsFilter() {
   return !!(STATE && STATE.settings && STATE.settings.filterMode);
 }
@@ -1478,6 +1699,11 @@ async function startRunEngine() {
     await API.engine({ on: false });
     return false;
   }
+  if (STATE) {
+    STATE.engineOn = true;
+    STATE.armed = true;
+    paintEnginePills(true, true);
+  }
   return true;
 }
 
@@ -1489,9 +1715,10 @@ async function runPaper() {
   if (await startRunEngine()) refresh();
 }
 
-/* "Place trades based on Indicator filters: All together (strict AND)": the
-   scanner universe is traded only when EVERY ticked Bullish/Bearish filter
-   passes together (the backend forces strict AND in this mode). */
+/* "Place trades based on Indicator filters": the scanner universe is traded
+   when the ticked Bullish/Bearish filters agree by majority (or satisfy the
+   AI Brain threshold when enabled); tick "All together (strict AND)" to demand
+   every filter. */
 async function runFilterPaper() {
   await saveRunMode({ callManual: true, aiPick: false, filterMode: true });
   if (await startRunEngine()) refresh();
@@ -1524,9 +1751,18 @@ function wire() {
       if (!r.ok) {
         uiAlert(r.error || "arm failed");
         await API.engine({ on: false });
+      } else if (STATE) {
+        // Optimistic: reflect ON immediately; the next poll re-confirms.
+        STATE.engineOn = true;
+        STATE.armed = true;
+        paintEnginePills(true, true);
       }
     } else {
       await API.engine({ on: false });
+      if (STATE) {
+        STATE.engineOn = false;
+        paintEnginePills(false, !!STATE.armed);
+      }
     }
     refresh();
   };
@@ -1612,11 +1848,9 @@ function wire() {
         await API.tick();
         refresh();
       } else if (act === "closeall") {
-        if (!(await uiConfirm(PAPER ? "Close ALL open paper trades at market?\n\nSimulated exits - no Dhan orders." : "Close ALL open trades at market?\n\nExits will be sent to Dhan.", { danger: true }))) return;
-        await API.squareOff();
-        refresh();
+        await squareOffAllTrades();
       } else if (act === "stoplall") {
-        if (!(await uiConfirm("Stop ALL running strategies? Open positions are NOT closed (use Close All Trades)."))) return;
+        if (!(await uiConfirm("Stop ALL running strategies? Open positions are NOT closed (use Square Off All Trades)."))) return;
         await API.engine({ on: false });
         await API.selectionSet({ action: "none" });
         refresh();
@@ -1641,12 +1875,10 @@ function wire() {
     };
   });
 
-  $("rtSquareOff").onclick = async () => {
-    if (!(await uiConfirm(PAPER ? "Close ALL open paper trades at market?\n\nSimulated exits - no Dhan orders." : "Close ALL open trades at market?\n\nExits will be sent to Dhan.", { danger: true }))) return;
-    await API.squareOff();
-    refresh();
-  };
-  $("rtRefreshAccount").onclick = () => refreshAccount();
+  const sqBtn = $("rtSquareOff");
+  if (sqBtn) sqBtn.onclick = () => squareOffAllTrades();
+  const refreshAccBtn = $("rtRefreshAccount");
+  if (refreshAccBtn) refreshAccBtn.onclick = () => refreshAccount();
 
   const condClear = $("rtCondLogClear");
   if (condClear)
@@ -1751,10 +1983,18 @@ function wire() {
   wireTradeSessions();
 
   // Individual Bullish / Bearish indicator-filter checkboxes.
+  // `filtersBusy` holds the row steady across the save round-trip so the 1s
+  // snapshot poll cannot revert a tick the user just made.
+  const saveFilters = () => {
+    filtersBusy = true;
+    return API.settings(settingsFromDom()).finally(() => {
+      filtersBusy = false;
+    });
+  };
   document.querySelectorAll("#tab-realtime [data-filter]").forEach((cb) => {
     cb.onchange = () => {
       syncInterlocks();
-      API.settings(settingsFromDom()).then(refresh);
+      saveFilters().then(refresh, refresh);
     };
   });
 
@@ -1776,7 +2016,7 @@ function wire() {
       const sec = document.getElementById("rtFilterSection" + side);
       if (sec) sec.querySelectorAll("[data-filter]").forEach((f) => (f.checked = on));
       syncInterlocks();
-      API.settings(settingsFromDom()).then(refresh);
+      saveFilters().then(refresh, refresh);
     };
   });
 
@@ -1802,7 +2042,7 @@ function wire() {
       });
       // syncInterlocks() re-derives each section master and dim state.
       syncInterlocks();
-      API.settings(settingsFromDom()).then(refresh);
+      saveFilters().then(refresh, refresh);
     };
 
   // Entry Timing Diagnostics.
@@ -1817,17 +2057,10 @@ function wire() {
 // ---------------------------------------------------------------------------
 // Render
 // ---------------------------------------------------------------------------
-function renderSnapshot(s) {
-  if (!s) return;
-  STATE = s;
-  if (!methodInit && s.method) {
-    activeMethod = s.method;
-    methodInit = true;
-    buildMethodCards();
-  }
-
-  const on = !!s.engineOn;
-  const armed = !!s.armed;
+// Paint the header engine/arm pills + toggle label. Used by the snapshot render
+// and by the engine toggle for an instant optimistic update, so the button always
+// reacts even before the next (now lightweight) poll confirms it.
+function paintEnginePills(on, armed) {
   const pEngine = document.getElementById("rtEnginePill");
   const pArm = document.getElementById("rtArmPill");
   if (pEngine) {
@@ -1840,6 +2073,20 @@ function renderSnapshot(s) {
   }
   const tg = document.getElementById("rtEngineToggle");
   if (tg) tg.textContent = "AI Smart Trading: " + (on ? "ON" : "OFF");
+}
+
+function renderSnapshot(s) {
+  if (!s) return;
+  STATE = s;
+  if (!methodInit && s.method) {
+    activeMethod = s.method;
+    methodInit = true;
+    buildMethodCards();
+  }
+
+  const on = !!s.engineOn;
+  const armed = !!s.armed;
+  paintEnginePills(on, armed);
   updateBalanceReadouts();
 
   // apply settings to the engine-control checkboxes/inputs
@@ -1888,6 +2135,15 @@ function renderSnapshot(s) {
   renderMarginBar(s.margin);
   renderRunning(s);
   renderClosed(s);
+  // Pull the full ledger once whenever the closed count changes (first load or a
+  // fresh close); the 1s poll itself only ever ships the newest slice.
+  const closedTotal = s.closedCount != null ? num(s.closedCount) : null;
+  if (closedTotal == null && CLOSED_CACHE == null) loadClosed();
+  // The on-demand ledger is authoritative and never behind the snapshot, so only
+  // re-pull when it is actually missing rows (cache shorter than the count). The
+  // old `!==` test re-fetched the whole multi-MB ledger every second whenever the
+  // two briefly disagreed, which alone could freeze the pane.
+  else if (closedTotal != null && (!CLOSED_CACHE || CLOSED_CACHE.length < closedTotal)) loadClosed();
   renderHoldings(s);
   loadPool();
   loadScanners();
@@ -1899,6 +2155,12 @@ function renderSnapshot(s) {
 
 // Live Top Movers + NIFTY trend readouts (auto CE/PE side source).
 async function loadScanners() {
+  // Three throttled readouts per call; they change on the server's own cadence,
+  // not every second, so polling them at 1s only added churn. Refresh a bit
+  // slower - the master-toggle state itself still updates on the 1s snapshot.
+  const now = Date.now();
+  if (now - scannerPollAt < 2500) return;
+  scannerPollAt = now;
   const cfg = (STATE && STATE.settings) || {};
   const ml = document.getElementById("rtMoversList");
   const tl = document.getElementById("rtNiftyTrendList");
@@ -2809,10 +3071,13 @@ function applySettingsToDom(s) {
     inp.value = Array.isArray(arr) ? arr.join(intLists.indexOf(k) >= 0 ? ", " : ", ") : (arr || "");
   });
   const filters = s.filters || {};
-  document.querySelectorAll("#tab-realtime [data-filter]").forEach((cb) => {
-    const k = cb.getAttribute("data-filter");
-    if (k in filters) cb.checked = !!filters[k];
-  });
+  // While a filter toggle is still saving, keep the user's ticks untouched: a
+  // snapshot fetched before the click would otherwise silently uncheck them.
+  if (!filtersBusy)
+    document.querySelectorAll("#tab-realtime [data-filter]").forEach((cb) => {
+      const k = cb.getAttribute("data-filter");
+      if (k in filters) cb.checked = !!filters[k];
+    });
   syncAstToggles(s);
   applyDataPoolUi(!!s.data_pool);
   syncInterlocks();
@@ -3209,7 +3474,21 @@ function renderClosed(s) {
   if (!body) return;
   const fmtT = (t) => (t ? istTime(num(t)) : "-");
   const on = chargesOn();
-  body.innerHTML = (s.closed || [])
+  // Prefer the full on-demand ledger; fall back to the snapshot's newest slice
+  // before the first `/closed` fetch resolves.
+  const list = CLOSED_CACHE && CLOSED_CACHE.length ? CLOSED_CACHE : ((s && s.closed) || []);
+  // Repaint only when the ledger (or the charges toggle) actually changed. A
+  // multi-thousand-row innerHTML rebuild on every 1s poll is the main reason the
+  // paper pane felt frozen; the rows themselves are immutable once booked.
+  const sig =
+    (CLOSED_CACHE && CLOSED_CACHE.length ? "c" : "s") +
+    ":" + list.length +
+    ":" + (list.length ? num(list[0].closedAt) : 0) +
+    ":" + (list.length ? num(list[list.length - 1].closedAt) : 0) +
+    ":" + (on ? "1" : "0");
+  if (sig === closedRenderSig) return;
+  closedRenderSig = sig;
+  body.innerHTML = list
     .map((c) => {
       const charges = on ? (c.charges != null ? num(c.charges) : estimateCharges(c.entry, c.exit, c.qty, c.side, c.instrument, c.tradingSymbol)) : 0;
       const net = on && c.netPnl != null ? num(c.netPnl) : num(c.pnl);
@@ -3442,6 +3721,11 @@ function renderConditionLog() {
   else if (lvl === "error") logs = logs.filter((l) => l.level === "error");
   const cnt = document.getElementById("rtCondLogCount");
   if (cnt) cnt.textContent = logs.length + " line(s)";
+  // Skip the DOM rebuild while the visible lines are unchanged (same count and
+  // same newest line): the poll runs every second but logs only move on events.
+  const sig = logs.length + ":" + (logs.length ? num(logs[0].t) : 0) + ":" + lvl;
+  if (sig === logRenderSig) return;
+  logRenderSig = sig;
   const color = (l) => (l === "error" ? "#ef5350" : l === "warn" ? "#ffb300" : "#66ccff");
   body.innerHTML = logs.length
     ? logs
@@ -3733,8 +4017,19 @@ async function loadCatalog() {
 }
 
 async function refresh() {
+  if (refreshInFlight) {
+    // Coalesce: run one more pass right after the current response lands, so a
+    // refresh requested by a button/post never races the in-flight poll.
+    refreshQueued = true;
+    return;
+  }
+  refreshInFlight = true;
+  const seq = ++refreshSeq;
   try {
     const s = await API.snapshot();
+    // Single-flight means only one snapshot can resolve, so this holds; kept as
+    // a belt-and-braces guard against any future parallel path.
+    if (seq !== refreshSeq) return;
     renderSnapshot(s);
     const conn = document.getElementById("rtConn");
     if (conn && !document.body.classList.contains("link-alarm")) {
@@ -3743,12 +4038,45 @@ async function refresh() {
     }
     fillCatalog();
   } catch (e) {
+    // A stale request that fails after a newer one succeeded must not flip the
+    // connection pill back to "unavailable".
+    if (seq !== refreshSeq) return;
     console.warn("realtime refresh failed", e);
     const conn = document.getElementById("rtConn");
     if (conn) {
       conn.textContent = PAPER ? "paper engine unavailable" : "engine unavailable";
       conn.className = "rt-pill off";
     }
+  } finally {
+    refreshInFlight = false;
+    if (refreshQueued) {
+      refreshQueued = false;
+      refresh();
+    }
+  }
+}
+
+// Full closed-trade ledger, loaded on demand (not on the 1s poll). The snapshot
+// carries only the newest slice plus the total count; when the count changes we
+// re-pull the full ledger once, so every trade still shows without paying the
+// payload cost every second.
+async function loadClosed() {
+  if (closedLoading) return;
+  // Coalesce: a burst of closes must not kick off a multi-MB fetch on every
+  // poll. One refresh per few seconds is plenty for a read-only ledger.
+  if (Date.now() - closedLoadedAt < 3000) return;
+  closedLoading = true;
+  closedLoadedAt = Date.now();
+  try {
+    const r = await API.closed();
+    if (r && Array.isArray(r.closed)) {
+      CLOSED_CACHE = r.closed;
+      renderClosed(STATE);
+    }
+  } catch (e) {
+    console.warn("closed ledger load failed", e);
+  } finally {
+    closedLoading = false;
   }
 }
 
@@ -4069,6 +4397,21 @@ export function bootRealtime() {
   }, 1000);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden && active()) refresh();
+  });
+  // Gear on the Straight Line Consensus filter rows opens its per-filter
+  // settings (Min net votes / Confirm bars / Swing strength / colors / width).
+  document.addEventListener("click", (e) => {
+    const t = e.target;
+    if (t && t.classList && t.classList.contains("sc-gear")) {
+      e.preventDefault();
+      e.stopPropagation();
+      openConsensusSettings();
+    }
+    if (t && t.classList && t.classList.contains("pt-gear")) {
+      e.preventDefault();
+      e.stopPropagation();
+      openPivotTrendSettings(t.getAttribute("data-pt") === "resistance" ? "resistance" : "support");
+    }
   });
 }
 

@@ -8,6 +8,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
@@ -144,8 +145,24 @@ async fn health() -> impl IntoResponse {
 async fn main() {
     tracing_subscriber::fmt().with_target(false).init();
 
-    let static_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/static");
-    let index = ServeFile::new(concat!(env!("CARGO_MANIFEST_DIR"), "/static/index.html"));
+    // Resolve the UI directory at runtime so an installed/packaged build finds
+    // its assets next to the executable (or in the current working directory),
+    // and only falls back to the source-tree path during development.
+    let static_dir: PathBuf = {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("static"));
+            }
+        }
+        candidates.push(PathBuf::from("static"));
+        candidates.push(PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/static")));
+        candidates
+            .into_iter()
+            .find(|p| p.join("index.html").is_file())
+            .unwrap_or_else(|| PathBuf::from("static"))
+    };
+    let index = ServeFile::new(Path::new(&static_dir).join("index.html"));
 
     let market = MarketState::new();
     let dhan = DhanState::new(market.clone());

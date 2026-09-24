@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target
 
+# Packaged installers / distributables
+/dist/
+
 # Runtime state (realtime engine persisted state)
 /data/
 

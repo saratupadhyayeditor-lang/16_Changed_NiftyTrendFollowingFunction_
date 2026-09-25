@@ -1063,14 +1063,7 @@ function shell() {
       <div class="rt-engine-row">
         <b class="rt-cap">NIFTY:</b>
         <span id="rtNiftyStatus" style="font-size:11px;color:#ffd700"></span>
-        <label class="rtom-f">TF
-          <select data-set="niftyTf" style="width:90px">
-            <option value="1min">1 min</option>
-            <option value="5min">5 min</option>
-            <option value="15min">15 min</option>
-            <option value="both">Both</option>
-          </select></label>
-        <span style="font-size:9px;color:#666">Ensemble trend, refreshed at most once a minute.</span>
+        <span style="font-size:9px;color:#666">Straight-line confirm indicators drive the ensemble trend.</span>
       </div>
 
       <div class="rt-engine-row">
@@ -1129,6 +1122,18 @@ function shell() {
       </div>
       <div id="rtMoversList" style="display:none;margin-top:4px;font-size:9px;color:#ccc;background:#12122a;border:1px solid #2d2d50;border-radius:4px;padding:6px 8px"></div>
 
+      <div class="rt-engine-row">
+        <b class="rt-cap" style="color:#00d4aa">NIFTY Trend Following:</b>
+        <button class="btn-action" data-toggle="niftyTrendOn" id="rtNiftyTrendToggle" style="width:auto;padding:3px 10px;margin:0;font-size:10px">Trend Follow: OFF</button>
+        <label class="rtom-f">Confirm indicators
+          <select id="rtNiftyTrendConfIndSelect" style="min-width:160px"><option value="">-- pick indicator --</option></select>
+        </label>
+        <button class="btn-action" id="rtNiftyTrendConfIndAdd" style="width:auto;padding:3px 10px;margin:0">Add</button>
+        <span id="rtNiftyTrendConfIndList" style="font-size:9px;color:#ccc;display:flex;flex-wrap:wrap;gap:4px;align-items:center"></span>
+        <input type="hidden" data-list="niftyTrendConfInds">
+      </div>
+      <div id="rtNiftyTrendList" style="display:none;margin-top:4px;font-size:9px;color:#ccc;background:#12122a;border:1px solid #2d2d50;border-radius:4px;padding:6px 8px"></div>
+
       <div class="rt-engine-row" id="rtMoversTplRow" style="border-color:#4a3a0a;align-items:flex-start">
         <b class="rt-cap" style="color:#b39ddb">Assign AST Template to direction:</b>
         <div style="flex-basis:100%;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
@@ -1144,45 +1149,6 @@ function shell() {
           </label>
           <button class="btn-action" id="rtAssignMoverBear" style="width:auto;padding:3px 10px;margin:0;font-size:10px">Assign</button>
           <span id="rtMoverBearTplList" style="font-size:9px;color:#ccc;display:inline-flex;flex-wrap:wrap;gap:4px;align-items:center"></span>
-        </div>
-      </div>
-
-      <div class="rt-engine-row">
-        <b class="rt-cap" style="color:#00d4aa">NIFTY Trend Following:</b>
-        <button class="btn-action" data-toggle="niftyTrendOn" id="rtNiftyTrendToggle" style="width:auto;padding:3px 10px;margin:0;font-size:10px">Trend Follow: OFF</button>
-        <label class="rtom-f"><input type="checkbox" data-set="niftyTrendPctOn"> F&amp;O daily change min % <input type="number" data-set="niftyTrendPct" min="0.01" step="0.01" style="width:56px"></label>
-        <label class="rtom-f"><input type="checkbox" data-set="niftyTrendTopn"> Auto pick top gainer/top loser <input type="number" data-set="niftyTrendTopnCount" min="1" step="1" style="width:56px"></label>
-        <label class="rtom-f"><input type="checkbox" data-set="niftyTrendIndices"> Include indices for trading</label>
-        <label class="rtom-f">Index
-          <select id="rtNiftyTrendIndicesSelect" style="min-width:130px"><option value="">-- pick index --</option></select>
-        </label>
-        <button class="btn-action" id="rtNiftyTrendIndicesAdd" style="width:auto;padding:3px 10px;margin:0">Add</button>
-        <span id="rtNiftyTrendIndicesList" style="font-size:9px;color:#ccc;display:flex;flex-wrap:wrap;gap:4px;align-items:center"></span>
-        <input type="hidden" data-list="niftyTrendIndexList">
-        <label class="rtom-f">Confirm indicators
-          <select id="rtNiftyTrendConfIndSelect" style="min-width:160px"><option value="">-- pick indicator --</option></select>
-        </label>
-        <button class="btn-action" id="rtNiftyTrendConfIndAdd" style="width:auto;padding:3px 10px;margin:0">Add</button>
-        <span id="rtNiftyTrendConfIndList" style="font-size:9px;color:#ccc;display:flex;flex-wrap:wrap;gap:4px;align-items:center"></span>
-        <input type="hidden" data-list="niftyTrendConfInds">
-      </div>
-      <div id="rtNiftyTrendList" style="display:none;margin-top:4px;font-size:9px;color:#ccc;background:#12122a;border:1px solid #2d2d50;border-radius:4px;padding:6px 8px"></div>
-
-      <div class="rt-engine-row" id="rtNiftyTplRow" style="border-color:#4a3a0a;align-items:flex-start">
-        <b class="rt-cap" style="color:#b39ddb">Assign AST Template to direction:</b>
-        <div style="flex-basis:100%;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-          <label class="rtom-f" style="color:#00d4aa">NIFTY bullish &rarr; template
-            <select id="rtTplNiftyBull" style="min-width:190px"></select>
-          </label>
-          <button class="btn-action" id="rtAssignNiftyBull" style="width:auto;padding:3px 10px;margin:0;font-size:10px">Assign</button>
-          <span id="rtNiftyBullTplList" style="font-size:9px;color:#ccc;display:inline-flex;flex-wrap:wrap;gap:4px;align-items:center"></span>
-        </div>
-        <div style="flex-basis:100%;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
-          <label class="rtom-f" style="color:#ef5350">NIFTY bearish &rarr; template
-            <select id="rtTplNiftyBear" style="min-width:190px"></select>
-          </label>
-          <button class="btn-action" id="rtAssignNiftyBear" style="width:auto;padding:3px 10px;margin:0;font-size:10px">Assign</button>
-          <span id="rtNiftyBearTplList" style="font-size:9px;color:#ccc;display:inline-flex;flex-wrap:wrap;gap:4px;align-items:center"></span>
         </div>
       </div>
 
@@ -1628,7 +1594,7 @@ function settingsFromDom() {
     const k = inp.getAttribute("data-set");
     s[k] = inp.type === "checkbox" ? inp.checked : inp.type === "number" ? num(inp.value) : inp.value;
   });
-  const intLists = ["moversIndices", "niftyTrendIndexList", "commodityList", "scannerExclude"];
+  const intLists = ["moversIndices", "commodityList", "scannerExclude"];
   document.querySelectorAll("#tab-realtime [data-list]").forEach((inp) => {
     const k = inp.getAttribute("data-list");
     const raw = String(inp.value || "").split(",").map((x) => x.trim()).filter(Boolean);
@@ -1819,15 +1785,8 @@ function wire() {
 
   document.querySelectorAll("#tab-realtime [data-set]").forEach((inp) => {
     inp.onchange = () => {
-      // NIFTY trend pick modes are mutually exclusive (daily change% XOR top-N).
       const k = inp.getAttribute("data-set");
-      if (k === "niftyTrendPctOn" && inp.checked) {
-        const t = document.querySelector('#tab-realtime [data-set="niftyTrendTopn"]');
-        if (t) t.checked = false;
-      } else if (k === "niftyTrendTopn" && inp.checked) {
-        const p = document.querySelector('#tab-realtime [data-set="niftyTrendPctOn"]');
-        if (p) p.checked = false;
-      } else if (k === "fastestRising" && inp.checked) {
+      if (k === "fastestRising" && inp.checked) {
         // Old engine: "Pick fastest positive rising LTP" needs both sides
         // inside the pool, so it auto-sets Execute Trade In to
         // "Above and below including ATM" (the user can still change it).
@@ -2215,7 +2174,7 @@ async function loadScanners() {
         .join(" ");
       tl.innerHTML =
         `Direction: ${dirTxt}<br>` +
-        `<span style="color:#888">Picks (${picks.length}):</span> ${pfmt || (cfg.niftyTrendTopn ? "(none qualify yet)" : "auto-pick OFF")}`;
+        `<span style="color:#888">Picks (${picks.length}):</span> ${pfmt || "(none qualify yet)"}`;
       tl.querySelectorAll("[data-sc-remove]").forEach((b) => {
         b.onclick = (e) => {
           e.preventDefault();
@@ -2304,7 +2263,6 @@ function renderChips(key, containerId, kind) {
 }
 function renderAllChips() {
   renderChips("moversIndices", "rtMoversIndicesList", "index");
-  renderChips("niftyTrendIndexList", "rtNiftyTrendIndicesList", "index");
   renderChips("niftyTrendConfInds", "rtNiftyTrendConfIndList", "indicator");
   renderChips("commodityList", "rtCommodityChips", "commodity");
 }
@@ -2427,10 +2385,6 @@ function populateAstSelects() {
   const inds = (CATALOG.indicators || []).map((i) => ({ v: i.id, i }));
   if (!indices.length && !inds.length) return;
   fill("rtMoversIndicesSelect", indices, (r) => `${r.s.name} (${r.v})`);
-  fill("rtNiftyTrendIndicesSelect", indices, (r) => `${r.s.name} (${r.v})`);
-  // NIFTY Trend Following reads only straight-line indicators (their line
-  // direction decides the side), so its confirm list is restricted to them.
-  const straightIds = ["slconsensus", "ovlconsensus", "autotrend", "projline", "zzline", "trendmaster", "panemaster", "srema", "supline", "resline", "pitchfork", "fibfan", "gannfan", "supplydemand", "wavefib", "pastruct", "vl"];
   const straightInds = inds.filter((r) => straightIds.includes(String(r.v)));
   fill("rtNiftyTrendConfIndSelect", straightInds, (r) => `${r.i.name || r.i.id}${r.i.cat ? " · " + r.i.cat : ""}`);
   astSelectsPopulated = true;
@@ -2453,12 +2407,9 @@ function wirePicker(selectId, addId, key, listId, kind) {
 }
 function wireAstPickers() {
   wirePicker("rtMoversIndicesSelect", "rtMoversIndicesAdd", "moversIndices", "rtMoversIndicesList", "index");
-  wirePicker("rtNiftyTrendIndicesSelect", "rtNiftyTrendIndicesAdd", "niftyTrendIndexList", "rtNiftyTrendIndicesList", "index");
   wirePicker("rtNiftyTrendConfIndSelect", "rtNiftyTrendConfIndAdd", "niftyTrendConfInds", "rtNiftyTrendConfIndList", "indicator");
   wireAssign("rtTplMoverBull", "rtAssignMoverBull", "moverBullTemplate", "bullish");
   wireAssign("rtTplMoverBear", "rtAssignMoverBear", "moverBearTemplate", "bearish");
-  wireAssign("rtTplNiftyBull", "rtAssignNiftyBull", "niftyBullTemplate", "bullish");
-  wireAssign("rtTplNiftyBear", "rtAssignNiftyBear", "niftyBearTemplate", "bearish");
   renderAllChips();
 }
 
@@ -2852,6 +2803,10 @@ function renderRunInStatus() {
   const autoLive = (STATE && STATE.autoSide) || "";
   const nt = (STATE && STATE.niftyTrend) || {};
   const mv = (STATE && STATE.movers) || {};
+  // Both straight-line sets assigned: a bullish line trades the Top Gainer (CE)
+  // leg and a bearish line the Top Loser (PE) leg at the same time, so the
+  // status must show both legs together instead of a single resolved side.
+  const niftyBoth = !!(s.niftyTrendOn && nt.bothActive);
   let src = "";
   if (autoLive) {
     if (s.niftyTrendOn && nt.dir) src = "NIFTY trend";
@@ -2874,6 +2829,10 @@ function renderRunInStatus() {
     if (!enabled) {
       status.style.color = "#666";
       status.textContent = "off";
+    } else if (autoOn && niftyBoth) {
+      status.style.color = "#00d4aa";
+      status.textContent =
+        "auto: BOTH legs CE + PE - NIFTY trend (bull line -> Top Gainers / bear line -> Top Losers, each on its own side)";
     } else if (autoOn) {
       status.style.color = autoLive ? "#00d4aa" : "#66ccff";
       status.textContent = autoLive
@@ -2988,20 +2947,11 @@ function syncInterlocks() {
   setv("rtRunInRow", prem);
   setv("rtTradeInRow", prem);
 
-  // --- NIFTY pick mode (daily change% XOR auto top-N), faded when trend off. ---
+  // --- NIFTY trend-following: the confirmation-indicator picker is live only
+  //     while the trend mode is active. ---
   const s = (STATE && STATE.settings) || {};
   const trendEnabled = !!s.niftyTrendOn;
   const ntActive = trendEnabled;
-  const pctOn = checked("niftyTrendPctOn");
-  const topnOn = checked("niftyTrendTopn");
-  dimControl(q("niftyTrendPctOn"), !ntActive);
-  dimControl(q("niftyTrendTopn"), !ntActive);
-  dimControl(q("niftyTrendPct"), !ntActive || !pctOn);
-  dimControl(q("niftyTrendTopnCount"), !ntActive || !topnOn);
-
-  // NIFTY index / confirmation-indicator pickers: live only while trend mode
-  // is active; the index picker additionally follows its "Include indices" box.
-  const incIdx = checked("niftyTrendIndices");
   const dimRow = (id, on) => {
     const row = document.getElementById(id);
     if (row) {
@@ -3012,9 +2962,6 @@ function syncInterlocks() {
   };
   dimRow("rtNiftyTrendConfIndSelect", !ntActive);
   dimRow("rtNiftyTrendConfIndAdd", !ntActive);
-  dimRow("rtNiftyTrendIndicesSelect", !ntActive || !incIdx);
-  dimRow("rtNiftyTrendIndicesAdd", !ntActive || !incIdx);
-  dimControl(q("niftyTrendIndices"), !ntActive);
 
   // --- Top Movers: faded while NIFTY trend-following is on
   //     (the toggle stays clickable so the user can switch back). ---
@@ -3038,12 +2985,9 @@ function syncInterlocks() {
   });
 
   // --- Manual filter list goes inactive while a saved AST template owns the
-  //     active Top Movers / NIFTY trend direction (the template supplies the
-  //     filters). ---
+  //     active Top Movers direction (the template supplies the filters). ---
   const hasTpl = (k) => String(s[k] || "").trim() !== "";
-  const listLocked =
-    (trendEnabled && (hasTpl("niftyBullTemplate") || hasTpl("niftyBearTemplate"))) ||
-    (!!s.moversOn && (hasTpl("moverBullTemplate") || hasTpl("moverBearTemplate")));
+  const listLocked = !!s.moversOn && (hasTpl("moverBullTemplate") || hasTpl("moverBearTemplate"));
   const frow = document.getElementById("rtFilterRow");
   if (frow) {
     frow.style.opacity = listLocked ? "0.6" : "";
@@ -3065,7 +3009,7 @@ function applySettingsToDom(s) {
     if (inp.type === "checkbox") inp.checked = !!s[k];
     else inp.value = s[k] == null ? "" : s[k];
   });
-  const intLists = ["moversIndices", "niftyTrendIndexList", "commodityList", "scannerExclude"];
+  const intLists = ["moversIndices", "commodityList", "scannerExclude"];
   document.querySelectorAll("#tab-realtime [data-list]").forEach((inp) => {
     const k = inp.getAttribute("data-list");
     if (!(k in s)) return;
@@ -3897,12 +3841,8 @@ function renderTemplateAssignment() {
   const s = (STATE && STATE.settings) || {};
   setDirSelect("rtTplMoverBull", "bullish", s.moverBullTemplate);
   setDirSelect("rtTplMoverBear", "bearish", s.moverBearTemplate);
-  setDirSelect("rtTplNiftyBull", "bullish", s.niftyBullTemplate);
-  setDirSelect("rtTplNiftyBear", "bearish", s.niftyBearTemplate);
   assignedTplChip("rtMoverBullTplList", "moverBullTemplate", "bullish", s.moverBullTemplate);
   assignedTplChip("rtMoverBearTplList", "moverBearTemplate", "bearish", s.moverBearTemplate);
-  assignedTplChip("rtNiftyBullTplList", "niftyBullTemplate", "bullish", s.niftyBullTemplate);
-  assignedTplChip("rtNiftyBearTplList", "niftyBearTemplate", "bearish", s.niftyBearTemplate);
 }
 function wireAssign(selId, btnId, key, side) {
   const btn = document.getElementById(btnId);

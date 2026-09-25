@@ -1,5 +1,5 @@
 use axum::{
-    extract::{FromRef, Query, State},
+    extract::{DefaultBodyLimit, FromRef, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json},
     routing::{get, post},
@@ -209,7 +209,11 @@ async fn main() {
             axum::http::header::CACHE_CONTROL,
             axum::http::HeaderValue::from_static("no-cache, no-store, must-revalidate"),
         ))
-        .layer(CorsLayer::permissive());
+        .layer(CorsLayer::permissive())
+        // Backups (localStorage + two full engine states incl. the whole closed
+        // ledger) routinely exceed axum's 2 MB default body limit. Allow large
+        // restore uploads on every route instead of failing with HTTP 413.
+        .layer(DefaultBodyLimit::max(256 * 1024 * 1024));
 
     let port: u16 = std::env::var("PORT")
         .ok()

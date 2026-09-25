@@ -1250,6 +1250,50 @@ impl RealtimeState {
         self.doc.lock().ok()
     }
 
+    /// Full durable engine state (`RtDoc`) as JSON for the Backup tab. This is
+    /// the *entire* engine: settings, indicator filters, strategies, saved
+    /// templates, staging/final lists, open positions and the whole closed
+    /// ledger (trade statistics) - not just the derived UI snapshot.
+    pub fn export_state(&self) -> Value {
+        self.doc()
+            .and_then(|d| serde_json::to_value(&*d).ok())
+            .unwrap_or(Value::Null)
+    }
+
+    /// Replace the whole durable engine state from a backup, then persist it to
+    /// disk. Only a syntactically valid `RtDoc` is accepted. Returns the number
+    /// of strategies + positions + closed trades restored for the status line.
+    pub fn import_state(&self, v: &Value) -> Result<usize, String> {
+        let mut parsed: RtDoc = serde_json::from_value(v.clone())
+            .map_err(|e| format!("invalid engine state: {e}"))?;
+        // Apply the same normalisation the startup loader does, so a restored
+        // state can never carry a nonsense HFT/limit value.
+        if parsed.settings.trade_limit_count <= 0 {
+            parsed.settings.trade_limit_count = 5;
+        }
+        if parsed.settings.hft_ops <= 0 {
+            parsed.settings.hft_ops = 6;
+        }
+        parsed.settings.hft_ops = hft_ops_budget(parsed.settings.hft_ops);
+        if !matches!(
+            parsed.settings.hft_exec_on.as_str(),
+            "open" | "high" | "low" | "close" | "candle_open" | "candle_high" | "candle_low" | "candle_close"
+        ) {
+            parsed.settings.hft_exec_on = "close".into();
+        }
+        let count = parsed.strategies.len() + parsed.positions.len() + parsed.closed.len();
+        {
+            let mut d = self.doc.lock().map_err(|_| "state lock poisoned".to_string())?;
+            *d = parsed;
+        }
+        self.save();
+        // Force the next scanner passes to rebuild against the restored state.
+        self.last_movers.store(0, Ordering::Relaxed);
+        self.last_nifty_scan.store(0, Ordering::Relaxed);
+        self.last_trend.store(0, Ordering::Relaxed);
+        Ok(count)
+    }
+
     /// Closed-trade ledger + armed flag for the Trade Stats report. Uses the
     /// full ledger (not the snapshot's 500-row cap) so period windows and the
     /// time-of-day analysis see the entire executed history.
@@ -8246,6 +8290,22 @@ pub async fn templates_get(State(rt): State<RealtimeState>) -> impl IntoResponse
     Json(json!({ "ok": true, "templates": list }))
 }
 
+/// Backup tab: full durable engine state (settings, strategies, templates,
+/// positions, closed ledger / trade statistics) as JSON.
+pub async fn state_export_get(State(rt): State<RealtimeState>) -> impl IntoResponse {
+    Json(json!({ "ok": true, "state": rt.export_state() }))
+}
+
+/// Backup tab: replace the whole engine state from a snapshot, persist it, and
+/// report how many strategies/positions/closed trades were restored.
+pub async fn state_import_post(State(rt): State<RealtimeState>, Json(v): Json<Value>) -> impl IntoResponse {
+    let state = v.get("state").cloned().unwrap_or(Value::Null);
+    match rt.import_state(&state) {
+        Ok(n) => Json(json!({ "ok": true, "restored": n })),
+        Err(e) => Json(json!({ "ok": false, "message": e })),
+    }
+}
+
 pub async fn template_post(State(rt): State<RealtimeState>, Json(v): Json<Value>) -> impl IntoResponse {
     let action = js(&v, "action");
     let name = js(&v, "name");
@@ -8716,6 +8776,8 @@ macro_rules! rt_routes {
             .route(concat!($p, "/container"), get(container_get))
             .route(concat!($p, "/logs"), get(logs_get))
             .route(concat!($p, "/stats"), get(crate::stats::stats_get))
+            .route(concat!($p, "/state/export"), get(state_export_get))
+            .route(concat!($p, "/state/import"), post(state_import_post))
     };
 }
 

@@ -1,9 +1,12 @@
 /* Backup & Restore system for the complete algo suite (Rust port).
  *
- * Direct port of the old Python app's `static/backup.js`. Captures the ENTIRE
- * algo system state - every engine's settings, all saved templates, all saved
- * strategies, P&L records and monitor lists - because every one of those
- * persists in the browser's localStorage.
+ * Port of the old Python app's `static/backup.js`. Captures the ENTIRE algo
+ * system state in two parts:
+ *   1. browser localStorage (chart/UI preferences, monitor lists), and
+ *   2. the server-side durable engine state of BOTH engines - realtime and
+ *      paper - read from `/api/{rt,paper}/state/export`. That is every engine's
+ *      settings, indicator filters, saved templates, staging/final strategy
+ *      lists, open positions and the full closed-trade ledger (trade stats).
  *
  * Features:
  *   - Export Now: write a full timestamped snapshot to the configured path
@@ -11,7 +14,8 @@
  *   - Download Backup: same full snapshot as a .json download, works even when
  *     no path is configured.
  *   - Import / Restore: apply a backup file or a server-stored snapshot back
- *     into localStorage and reload. A safety copy is taken before restoring.
+ *     into localStorage *and* both engines, then reload. A safety copy is taken
+ *     before restoring.
  *   - Auto incremental backup: enable/disable toggle + minute/hour/daily/weekly
  *     schedule. A background timer fires when the scheduled time is reached and
  *     catches up immediately after the page loads if a schedule was missed while
@@ -124,26 +128,69 @@ function gatherLS() {
   return out;
 }
 
+/* Server-side engine state: the Rust app persists every engine's settings,
+ * strategies, saved AST templates, positions and the full closed ledger (trade
+ * statistics) in server files, NOT in localStorage. A complete backup must
+ * capture both engines (real + paper) no matter which tab runs it. */
+function collectEngineState() {
+  const grab = (url) => fetch(url).then(function (r) { return r.json(); }).catch(function () { return null; });
+  return Promise.all([grab("/api/rt/state/export"), grab("/api/paper/state/export")]).then(function (res) {
+    const engine = {};
+    if (res[0] && res[0].ok && res[0].state) engine.realtime = res[0].state;
+    if (res[1] && res[1].ok && res[1].state) engine.paper = res[1].state;
+    return engine;
+  });
+}
+
+/* Engine state does NOT live under /api/backup, so it must be posted to the
+ * engine routes directly (a plain relative fetch, same origin as the page). */
+function postEngineState(url, state) {
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ state: state }),
+  }).then(function (r) {
+    return r.json().catch(function () { return { ok: false, message: "Bad server response" }; });
+  });
+}
+
 function buildSnapshot(kind) {
   const ls = gatherLS();
-  return {
-    format: "algodhan_backup",
-    version: 1,
-    created_at: new Date().toISOString(),
-    kind: kind || "manual",
-    app: "Smart NTrader + Algo Suite",
-    count: { keys: Object.keys(ls).length },
-    data: { localStorage: ls },
-    config: _cfg || null,
-  };
+  return collectEngineState().then(function (engine) {
+    const engines = (engine.realtime ? 1 : 0) + (engine.paper ? 1 : 0);
+    return {
+      format: "algodhan_backup",
+      version: 2,
+      created_at: new Date().toISOString(),
+      kind: kind || "manual",
+      app: "Smart NTrader + Algo Suite",
+      count: { keys: Object.keys(ls).length, engines: engines },
+      data: { localStorage: ls, engine: engine },
+      config: _cfg || null,
+    };
+  });
 }
 
 function applyData(data) {
-  const ls = data && data.data && data.data.localStorage;
-  if (!ls || typeof ls !== "object") throw new Error("Invalid backup: missing data.localStorage");
+  const payload = data && data.data;
+  if (!payload || typeof payload !== "object") throw new Error("Invalid backup: missing data");
   let n = 0;
-  Object.keys(ls).forEach(function (k) { localStorage.setItem(k, ls[k]); n++; });
-  return n;
+  const ls = payload.localStorage;
+  if (ls && typeof ls === "object") {
+    Object.keys(ls).forEach(function (k) { localStorage.setItem(k, ls[k]); n++; });
+  }
+  const engine = payload.engine;
+  if (!ls && !engine) throw new Error("Invalid backup: no localStorage or engine state");
+  const jobs = [];
+  if (engine && engine.realtime) jobs.push(postEngineState("/api/rt/state/import", engine.realtime));
+  if (engine && engine.paper) jobs.push(postEngineState("/api/paper/state/import", engine.paper));
+  return Promise.all(jobs).then(function (results) {
+    results.forEach(function (r) {
+      if (r && r.ok) n += (r.restored || 0);
+      else throw new Error((r && r.message) || "engine restore failed");
+    });
+    return n;
+  });
 }
 
 /* ---- actions -------------------------------------------------------------- */
@@ -156,27 +203,31 @@ function saveConfig(partial) {
 }
 
 function backupNow(kind) {
-  const snapshot = buildSnapshot(kind || "manual");
-  return api("/snapshot", { method: "POST", body: { data: snapshot.data, kind: snapshot.kind } })
+  return buildSnapshot(kind || "manual")
+    .then(function (snapshot) {
+      return api("/snapshot", { method: "POST", body: { data: snapshot.data, kind: snapshot.kind } });
+    })
     .then(function (r) {
       if (r.ok && r.config) _cfg = r.config;
       return r;
     });
 }
 
-function downloadBackup() {
-  const snapshot = buildSnapshot("manual");
-  const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  const ts = new Date().toISOString().replace(/[:T]/g, "").slice(0, 15);
-  a.href = url;
-  a.download = "algodhan_backup_" + ts + ".json";
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
-  return snapshot;
+function downloadBackup(snapshot) {
+  const got = snapshot ? Promise.resolve(snapshot) : buildSnapshot("manual");
+  return got.then(function (snap) {
+    const blob = new Blob([JSON.stringify(snap, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    const ts = new Date().toISOString().replace(/[:T]/g, "").slice(0, 15);
+    a.href = url;
+    a.download = "algodhan_backup_" + ts + ".json";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+    return snap;
+  });
 }
 
 /* ---- direct save to a PC folder (File System Access API) ------------------ */
@@ -253,28 +304,29 @@ function pruneDir(keep) {
 /* Auto backup: write to the chosen PC folder when available, otherwise fall
  * back to the server path. Scheduling state is always recorded server-side. */
 function autoBackup() {
-  const snapshot = buildSnapshot("auto");
-  if (_dirHandle && window.showDirectoryPicker) {
-    return saveToDir(snapshot).then(function (name) {
-      const keep = parseInt(($id("backupKeep") && $id("backupKeep").value) || "30", 10) || 30;
-      return pruneDir(keep).then(function () { return name; });
-    }).then(function (name) {
-      // Record schedule/lastResult server-side without writing a server file.
-      return api("/snapshot", { method: "POST", body: { data: snapshot.data, kind: "auto", pc_only: true } })
-        .then(function (r) {
-          if (r.ok && r.config) _cfg = r.config;
-          return { ok: true, file: name, dir: true, r: r };
-        })
-        .catch(function () { return { ok: true, file: name, dir: true, r: null }; });
-    }).catch(function () {
-      // PC save failed (permission etc.) -> fall back to server path.
-      return backupNow("auto").then(function (r) {
-        return { ok: r.ok, file: r.file, dir: false, r: r, message: r.message };
+  return buildSnapshot("auto").then(function (snapshot) {
+    if (_dirHandle && window.showDirectoryPicker) {
+      return saveToDir(snapshot).then(function (name) {
+        const keep = parseInt(($id("backupKeep") && $id("backupKeep").value) || "30", 10) || 30;
+        return pruneDir(keep).then(function () { return name; });
+      }).then(function (name) {
+        // Record schedule/lastResult server-side without writing a server file.
+        return api("/snapshot", { method: "POST", body: { data: snapshot.data, kind: "auto", pc_only: true } })
+          .then(function (r) {
+            if (r.ok && r.config) _cfg = r.config;
+            return { ok: true, file: name, dir: true, r: r };
+          })
+          .catch(function () { return { ok: true, file: name, dir: true, r: null }; });
+      }).catch(function () {
+        // PC save failed (permission etc.) -> fall back to server path.
+        return backupNow("auto").then(function (r) {
+          return { ok: r.ok, file: r.file, dir: false, r: r, message: r.message };
+        });
       });
+    }
+    return backupNow("auto").then(function (r) {
+      return { ok: r.ok, file: r.file, dir: false, r: r, message: r.message };
     });
-  }
-  return backupNow("auto").then(function (r) {
-    return { ok: r.ok, file: r.file, dir: false, r: r, message: r.message };
   });
 }
 
@@ -290,13 +342,16 @@ function importPayload(data) {
 function doRestore(data, sourceLabel) {
   // Safety copy of the CURRENT state before it is overwritten, so a bad
   // restore can always be rolled back. Best-effort: works when a path is set.
-  backupNow("pre_restore").then(function () {
-    let n;
-    try { n = applyData(data); }
-    catch (e) { statusLine("Restore failed: " + e.message, true); return; }
-    statusLine("Restored " + n + " settings from " + (sourceLabel || "backup") + " \u2014 reloading\u2026", false);
-    setTimeout(function () { location.reload(); }, 900);
-  });
+  return backupNow("pre_restore")
+    .catch(function () { return null; })
+    .then(function () { return applyData(data); })
+    .then(function (n) {
+      statusLine("Restored " + n + " items from " + (sourceLabel || "backup") + " \u2014 reloading\u2026", false);
+      setTimeout(function () { location.reload(); }, 1100);
+    })
+    .catch(function (e) {
+      statusLine("Restore failed: " + (e && e.message ? e.message : e), true);
+    });
 }
 
 function restoreServerFile(name) {
@@ -316,15 +371,17 @@ function handleImportFile(file) {
       statusLine("Import failed: not an algodhan backup file", true);
       return;
     }
-    importPayload(data).then(function () {
-      backupNow("pre_restore").then(function () {
-        let n;
-        try { n = applyData(data); }
-        catch (e) { statusLine("Import failed: " + e.message, true); return; }
-        statusLine("Imported " + n + " settings \u2014 reloading\u2026", false);
-        setTimeout(function () { location.reload(); }, 900);
+    importPayload(data)
+      .catch(function () { return null; })
+      .then(function () { return backupNow("pre_restore").catch(function () { return null; }); })
+      .then(function () { return applyData(data); })
+      .then(function (n) {
+        statusLine("Imported " + n + " items \u2014 reloading\u2026", false);
+        setTimeout(function () { location.reload(); }, 1100);
+      })
+      .catch(function (e) {
+        statusLine("Import failed: " + (e && e.message ? e.message : e), true);
       });
-    });
   };
   reader.readAsText(file);
 }
@@ -455,32 +512,37 @@ function wire() {
 
   $id("backupExportBtn").addEventListener("click", function () {
     if (_busy) return;
-    const snapshot = buildSnapshot("manual");
-    if (_dirHandle && window.showDirectoryPicker) {
-      _busy = true;
-      saveToDir(snapshot).then(function (name) {
-        _busy = false;
-        statusLine("Backup saved directly to PC folder: " + name, false);
-        $id("backupLastInfo").textContent = "saved to PC \u00b7 " + fmtTime(snapshot.created_at);
-      }).catch(function (err) {
-        _busy = false;
-        if (err && err.message === "No folder chosen") {
-          downloadBackup();
-          statusLine("Downloaded backup (" + snapshot.count.keys + " settings keys)", false);
-        } else {
-          statusLine("Direct save failed (" + (err && err.message || "error") + ") \u2014 downloaded instead.", true);
-          downloadBackup();
-        }
-      });
-    } else {
-      downloadBackup();
-      statusLine("Downloaded backup (" + snapshot.count.keys + " settings keys)", false);
-    }
+    _busy = true;
+    statusLine("Building full backup (settings + strategies + trade ledger)\u2026", false);
+    buildSnapshot("manual").then(function (snapshot) {
+      const countTxt = snapshot.count.keys + " keys + " + (snapshot.count.engines || 0) + " engines";
+      if (_dirHandle && window.showDirectoryPicker) {
+        return saveToDir(snapshot).then(function (name) {
+          statusLine("Backup saved directly to PC folder: " + name, false);
+          $id("backupLastInfo").textContent = "saved to PC \u00b7 " + fmtTime(snapshot.created_at);
+        }).catch(function (err) {
+          if (err && err.message === "No folder chosen") {
+            downloadBackup(snapshot);
+            statusLine("Downloaded backup (" + countTxt + ")", false);
+          } else {
+            statusLine("Direct save failed (" + (err && err.message || "error") + ") \u2014 downloaded instead.", true);
+            downloadBackup(snapshot);
+          }
+        });
+      }
+      downloadBackup(snapshot);
+      statusLine("Downloaded backup (" + countTxt + ")", false);
+    }).catch(function (e) {
+      statusLine("Backup failed: " + (e && e.message ? e.message : e), true);
+    }).then(function () { _busy = false; });
   });
 
   $id("backupDownloadBtn").addEventListener("click", function () {
-    const snap = downloadBackup();
-    statusLine("Downloaded backup (" + snap.count.keys + " settings keys)", false);
+    downloadBackup().then(function (snap) {
+      statusLine("Downloaded backup (" + snap.count.keys + " keys + " + (snap.count.engines || 0) + " engines)", false);
+    }).catch(function (e) {
+      statusLine("Download failed: " + (e && e.message ? e.message : e), true);
+    });
   });
 
   $id("backupImportBtn").addEventListener("click", function () {

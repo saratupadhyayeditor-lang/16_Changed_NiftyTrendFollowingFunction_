@@ -152,6 +152,16 @@ let commodityPopulated = false;
 let COMM_NAMES = {};
 let astSelectsPopulated = false;
 
+// Registry ids of the straight-line family. Only these may drive the NIFTY
+// Trend Following "Confirm indicators" picker: a rising line assigns to the Top
+// Gainer (CE) leg, a falling line to the Top Loser (PE) leg.
+const STRAIGHT_LINE_IDS = [
+  "slconsensus", "ovlconsensus", "autotrend", "projline", "zzline",
+  "trendmaster", "panemaster", "srema", "supline", "resline",
+  "pitchfork", "fibfan", "gannfan", "supplydemand", "wavefib",
+  "pastruct", "vl",
+];
+
 // Full indicator-filter catalogue from the old AST engine (Bullish / Bearish
 // sections). Keys are the old id minus the "astFilter" prefix, so "BullEmaTrend9"
 // maps to `astFilterBullEmaTrend9` in the Python app. Every toggle is persisted
@@ -1904,7 +1914,16 @@ function wire() {
       const k = b.getAttribute("data-toggle");
       const cur = !!((STATE && STATE.settings && STATE.settings[k]));
       const next = !cur;
-      pushSetting({ [k]: next });
+      const patch = { [k]: next };
+      // Top Movers and NIFTY Trend Following are connected and must run
+      // together: switching either one ON also switches the other ON. Turning
+      // one OFF stays individual (the other keeps its own state), and the old
+      // fade-out that forced one off while the other was on is gone.
+      if (next && (k === "moversOn" || k === "niftyTrendOn")) {
+        patch.moversOn = true;
+        patch.niftyTrendOn = true;
+      }
+      pushSetting(patch);
     };
   });
 
@@ -2385,7 +2404,7 @@ function populateAstSelects() {
   const inds = (CATALOG.indicators || []).map((i) => ({ v: i.id, i }));
   if (!indices.length && !inds.length) return;
   fill("rtMoversIndicesSelect", indices, (r) => `${r.s.name} (${r.v})`);
-  const straightInds = inds.filter((r) => straightIds.includes(String(r.v)));
+  const straightInds = inds.filter((r) => STRAIGHT_LINE_IDS.includes(String(r.v)));
   fill("rtNiftyTrendConfIndSelect", straightInds, (r) => `${r.i.name || r.i.id}${r.i.cat ? " · " + r.i.cat : ""}`);
   astSelectsPopulated = true;
   renderAllChips();
@@ -2963,9 +2982,11 @@ function syncInterlocks() {
   dimRow("rtNiftyTrendConfIndSelect", !ntActive);
   dimRow("rtNiftyTrendConfIndAdd", !ntActive);
 
-  // --- Top Movers: faded while NIFTY trend-following is on
-  //     (the toggle stays clickable so the user can switch back). ---
-  const mvActive = !!s.moversOn && !trendEnabled;
+  // --- Top Movers: independent of NIFTY trend-following. Both masters can be
+  //     ON together and run side by side (they are connected), so there is no
+  //     fade-out between them any more - only the controls for a scanner that
+  //     is itself OFF are dimmed. ---
+  const mvActive = !!s.moversOn;
   ["moversGainers", "moversLosers"].forEach((k) => dimControl(q(k), !mvActive));
   dimRow("rtMoversIndicesSelect", !mvActive);
   dimRow("rtMoversIndicesAdd", !mvActive);
@@ -3050,9 +3071,9 @@ function syncAstToggles(s) {
   const commOn = !!s.commodityOn;
   set(
     "rtMoversToggle",
-    !!s.moversOn && !trendOn,
-    trendOn ? "Top Movers: OFF - Trend Follow on" : "Top Movers: " + (s.moversOn ? "ON" : "OFF"),
-    trendOn
+    !!s.moversOn,
+    "Top Movers: " + (s.moversOn ? "ON" : "OFF"),
+    false
   );
   set("rtNiftyTrendToggle", trendOn, "Trend Follow: " + (trendOn ? "ON" : "OFF"), false);
   set("rtCommodityToggle", commOn, "Commodities: " + (commOn ? "ON" : "OFF"));

@@ -642,14 +642,18 @@ fn read_file(name: &str) -> (StatusCode, Value) {
 
 fn import_payload(body: &Value) -> (StatusCode, Value) {
     let data = body.get("data").cloned();
+    // A backup carries the browser localStorage (chart/UI preferences) *and*
+    // the server-side engine state (settings, strategies, trade ledger). Accept
+    // either, so an engine-only or an older localStorage-only file both import.
     let Some(data) = data.filter(|d| {
         d.get("localStorage")
             .map(|ls| ls.is_object())
             .unwrap_or(false)
+            || d.get("engine").map(|e| e.is_object()).unwrap_or(false)
     }) else {
         return (
             StatusCode::BAD_REQUEST,
-            json!({ "ok": false, "message": "Import payload must contain data.localStorage" }),
+            json!({ "ok": false, "message": "Import payload must contain data.localStorage or data.engine" }),
         );
     };
     let _g = LOCK.lock().unwrap();

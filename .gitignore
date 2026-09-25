@@ -1,8 +1,14 @@
 # Rust build artifacts
 /target
 
-# Packaged installers / distributables
+# Packaged installers / distributables (built locally, never part of source backup)
 /dist/
+/AlgoTradingSetup.exe
+/AlgoTradingApp.zip
+/crates/server/static/AlgoTradingSetup.exe
+/crates/server/static/AlgoTradingApp.zip
+*.exe
+*.zip
 
 # Runtime state (realtime engine persisted state)
 /data/
